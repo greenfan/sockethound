@@ -2,16 +2,8 @@
 
 # This code is open and free for you to use, modify, share, and build upon.
 # Feel free to tweak it, contribute back if you'd like, or use it in your projects—just keep the spirit of openness alive!
-# If you have questions or ideas, reach out to me please.
-# Copyright (c) 2025 Russell Dwyer rdwyer@fastmail.com www.russelldwyer.com
-# All rights reserved.
-# This Source Code Form is subject to the terms of the Mozilla Public 
-# License, v. 2.0. If a copy of the MPL was not distributed with this 
-# file, You can obtain one at https://mozilla.org/MPL/2.0/. 
-# This code is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR 
-# CONDITIONS OF ANY KIND, either express or implied. See the License 
-# for the specific language governing permissions and limitations under 
-# the License. 
+# If you have questions or ideas, reach out to me directly www.russelldwyer.com
+# This program is released under the MIT License - see https://opensource.org/licenses/MIT
 
 import socket
 import struct
