@@ -35,7 +35,7 @@ Requires Python 3.6+ and root privileges (for raw socket access). Tested on Linu
 ## Usage
 Run as root (e.g., with `sudo`) due to raw socket requirements.
 
-sudo python3 analyzer.py [options]
+sudo python3 sockethound.py [options]
 
 
 ### Options
@@ -45,13 +45,6 @@ sudo python3 analyzer.py [options]
 - `-p, --process <name>`: Filter by process name (e.g., "chrome").
 - `-g, --group`: Group connections by process.
 - `-d, --dns-count <number>`: Number of recent DNS queries to show (default: 5).
-
-### Example
-Capture traffic, group by process, and report every 5 seconds:
-
-sudo python3 analyzer.py -g -t 5
-
-Press Ctrl+C to exit and generate a final report.
 
 ### Sample Output:
 
