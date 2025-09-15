@@ -13,7 +13,7 @@ I created this program because I love tcpdump, but I wanted a way to visualize a
 Frustrated with the lack of real-time support with current protocol analyzers, and lack of real-time stat analysis, overcomplexity and resource inefficiencies from CLI tools like nethogs, I created sockethound with simplicity in mind. This offers real-time analysis and is designed for interoperability on *nix systems
 Feel free to tweak it, contribute back if you'd like, or use it in your projects—just keep the spirit of openness alive!
 
-See v1 branch for the initial ebpf prototype.
+See tcpdump_raw_parser branch for the initial tcpdump based prototype.
 
 ## Features
 - **Packet Capture and Parsing**: Captures all Ethernet frames (ETH_P_ALL) and parses IPv4, TCP, UDP, ICMP, and DNS packets, replicating `tcpdump` functionality for live traffic inspection.
@@ -53,33 +53,6 @@ sudo python3 analyzer.py -g -t 5
 
 Press Ctrl+C to exit and generate a final report.
 
-Sample Output:
+### Sample Output:
 
-Network Traffic Summary
-Duration: 10.8 seconds
-Total:   4.23 MB in 3343 packets
-Rate: 402.93 KB/s (310.9 packets/sec)
-
-Active Network Sockets (sorted by total bytes):
-────────────────────────────────────────────────────────────────────────────────────────────────────
-TCP  Src: 10.1.1.33      :36522  → Dst: 10.1.111.111   :3389   Bytes:   3.84 MB Count:   2700 [xfreerdp3]
-TCP  Src: 10.1.1.111     :80     → Dst: 10.1.1.33      :37644  Bytes: 278.50 KB Count:    325 [docker-proxy]
-TCP  Src: 10.1.1.111     :80     → Dst: 10.1.1.33      :34902  Bytes:  98.71 KB Count:    136 [chromium]
-TCP  Src: 10.1.1.33      :39412  → Dst: 10.1.111.111   :22     Bytes:   6.49 KB Count:     26 [sshd]
-TCP  Src: 10.1.1.33      :57888  → Dst: 10.1.111.111   :22     Bytes:   4.00 KB Count:     39 [sshd]
-TCP  Src: 127.0.0.1      :34866  → Dst: 127.0.0.1      :44444  Bytes:   2.67 KB Count:     12 [chromium] 
-TCP  Src: 10.1.1.33      :46164  → Dst: 10.1.111.111   :22     Bytes:   1.61 KB Count:     15 [ssh]
-TCP  Src: 127.0.0.1      :36220  → Dst: 127.0.0.1      :44444  Bytes:    684 B Count:     12 [chromium] 
-TCP  Src: 127.0.0.1      :38786  → Dst: 127.0.0.1      :44444  Bytes:    684 B Count:     12 [ssh]
-TCP  Src: 127.0.0.1      :44444  → Dst: 127.0.0.1      :54222  Bytes:    684 B Count:     12 [chromium] 
-TCP  Src: 127.0.0.1      :35988  → Dst: 127.0.0.1      :44444  Bytes:    344 B Count:      6 [ssh]
-TCP  Src: 127.0.0.1      :44444  → Dst: 127.0.0.1      :57254  Bytes:    344 B Count:      6 [ssh]
-TCP  Src: 127.0.0.1      :36818  → Dst: 127.0.0.1      :44444  Bytes:    340 B Count:      6 [ssh]
-UDP  Src: 10.1.99.6      :58320  → Dst: 172.18.0.2     :53     Bytes:    336 B Count:      4 [docker-proxy]
-UDP  Src: 10.1.99.6      :57932  → Dst: 172.18.0.2     :53     Bytes:    304 B Count:      4 [docker-proxy]
-UDP  Src: 10.1.1.33      :53     → Dst: 10.1.99.6      :58320  Bytes:    168 B Count:      2 [docker-proxy]
-ICMP Src: 10.1.1.1               → Dst: 10.1.1.33              Bytes:    152 B Count:      4 
-UDP  Src: 10.1.1.33      :53     → Dst: 10.1.99.6      :57932  Bytes:    152 B Count:      2 [docker-proxy]
-
-DNS Activity (including encrypted DNS):
-[12:29:56] api.us-west-2.aiv-delivery.net → 18.189.146.172
+![Network Socket Hound Example Output](https://raw.githubusercontent.com/greenfan/shellcode/refs/heads/master/git_ex.png)
