@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-
 # This code is open and free for you to use, modify, share, and build upon.
 # Feel free to tweak it, contribute back if you'd like, or use it in your projects—just keep the spirit of openness alive!
 # If you have questions or ideas, reach out to me directly www.russelldwyer.com
 # This program is released under the MIT License - see https://opensource.org/licenses/MIT
-
 import socket
 import struct
 import time
@@ -40,18 +38,22 @@ class Colors:
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Network Traffic Analyzer with Process Information')
-parser.add_argument('-n', '--no-local', action='store_true', 
+parser.add_argument('-n', '--no-local', action='store_true',
                     help='Exclude local traffic (127.0.0.0/8)')
 parser.add_argument('-t', '--time', type=int, default=10,
                     help='Time interval in seconds between reports (default: 10)')
 parser.add_argument('-c', '--count', type=int, default=20,
                     help='Number of connections to display (default: 20)')
-parser.add_argument('-p', '--process', type=str, 
+parser.add_argument('-p', '--process', type=str,
                     help='Filter by process name (e.g., "chrome", "firefox")')
 parser.add_argument('-g', '--group', action='store_true',
                     help='Group connections by process')
 parser.add_argument('-d', '--dns-count', type=int, default=5,
                     help='Number of recent DNS queries to display (default: 5)')
+parser.add_argument('-xx', '--truncate-output', action='store_true',
+                    help='Limit output to 60 lines')
+parser.add_argument('-e', '--exclude-lan', action='store_true',
+                    help='Exclude LAN traffic (192.168.0.0/16, 172.17.0.0/16, 10.0.0.0/8)')
 args = parser.parse_args()
 
 # Create a raw socket
@@ -70,26 +72,21 @@ def parse_ethernet(packet):
     eth_length = 14
     eth_header = packet[:eth_length]
     eth = struct.unpack('!6s6sH', eth_header)
-    
     dest_mac = format_mac(eth_header[0:6])
     src_mac = format_mac(eth_header[6:12])
     eth_protocol = socket.ntohs(eth[2])
-    
     return eth_protocol, src_mac, dest_mac, packet[eth_length:]
 
 def parse_ip(packet):
     iph = struct.unpack('!BBHHHBBH4s4s', packet[:20])
-    
     version_ihl = iph[0]
     version = version_ihl >> 4
     ihl = version_ihl & 0xF
     iph_length = ihl * 4
-    
     total_length = iph[2]  # Total IP packet length
     protocol = iph[6]
     src_addr = socket.inet_ntoa(iph[8])
     dst_addr = socket.inet_ntoa(iph[9])
-    
     return protocol, src_addr, dst_addr, packet[iph_length:], total_length
 
 def parse_tcp(packet):
@@ -105,30 +102,24 @@ def parse_dns(packet):
     try:
         # Skip UDP header (8 bytes)
         dns_data = packet[8:]
-        
         # Parse DNS header
         transaction_id = struct.unpack('!H', dns_data[0:2])[0]
         flags = struct.unpack('!H', dns_data[2:4])[0]
         is_response = (flags & 0x8000) != 0
         question_count = struct.unpack('!H', dns_data[4:6])[0]
         answer_count = struct.unpack('!H', dns_data[6:8])[0]
-        
         # Parse query section
         query_name, offset = extract_dns_name(dns_data, 12)
-        
         if offset + 4 <= len(dns_data):  # Ensure we have enough data
             query_type, query_class = struct.unpack('!HH', dns_data[offset:offset+4])
-            
             # For responses, try to extract answer
             answers = []
             if is_response and answer_count > 0:
                 current_offset = offset + 4  # Skip type and class
-                
                 # Try to extract answers
                 for _ in range(answer_count):
                     if current_offset + 12 > len(dns_data):
                         break
-                        
                     # For answer records, the first 2 bytes are either a pointer or a name
                     if (dns_data[current_offset] & 0xC0) == 0xC0:  # Compressed name pointer
                         current_offset += 2  # Skip pointer
@@ -136,24 +127,19 @@ def parse_dns(packet):
                         # Skip name field
                         _, name_length = extract_dns_name(dns_data, current_offset)
                         current_offset += name_length
-                    
                     if current_offset + 10 > len(dns_data):
                         break
-                        
                     ans_type, ans_class, ttl, rdlength = struct.unpack(
                         '!HHIH', dns_data[current_offset:current_offset+10]
                     )
                     current_offset += 10
-                    
                     # Handle A records (IPv4 addresses)
                     if ans_type == 1 and rdlength == 4 and current_offset + rdlength <= len(dns_data):
                         ip_bytes = dns_data[current_offset:current_offset+4]
                         ip_address = socket.inet_ntoa(ip_bytes)
                         answers.append(ip_address)
-                    
                     # Skip to next record
                     current_offset += rdlength
-            
             return {
                 'id': transaction_id,
                 'is_response': is_response,
@@ -162,44 +148,42 @@ def parse_dns(packet):
             }
     except Exception as e:
         pass
-    
     return None
 
 def extract_dns_name(data, offset):
     """Extract a DNS name starting at the given offset"""
     name_parts = []
     original_offset = offset
-    
     while True:
         if offset >= len(data):
             return '.'.join(name_parts), offset - original_offset
-            
         length = data[offset]
-        
         # Check for compression pointer
         if (length & 0xC0) == 0xC0:
             pointer = ((length & 0x3F) << 8) | data[offset+1]
             # For a pointer, we don't recursively follow it in this simple implementation
             return '.'.join(name_parts), offset + 2 - original_offset
-            
         # Check for end of name
         if length == 0:
             break
-            
         # Extract this label
         offset += 1
         if offset + length > len(data):
             break
-            
         label = data[offset:offset+length]
         name_parts.append(label.decode('utf-8', errors='ignore'))
         offset += length
-    
     return '.'.join(name_parts), offset + 1 - original_offset
 
 def is_local_traffic(src_addr, dst_addr):
     """Check if traffic is between localhost addresses (127.0.0.0/8)"""
     return src_addr.startswith('127.') and dst_addr.startswith('127.')
+
+def is_lan_traffic(src_addr, dst_addr):
+    """Check if both source and destination IPs are in local network ranges"""
+    def is_lan_ip(ip):
+        return ip.startswith('192.168.') or ip.startswith('10.') or ip.startswith('172.17.')
+    return is_lan_ip(src_addr) and is_lan_ip(dst_addr)
 
 def format_bytes(num_bytes):
     """Format bytes into human-readable format (B, KB, MB, GB)"""
@@ -240,16 +224,14 @@ class SocketProcessMapper:
         self.socket_to_process = {}
         self.last_refresh = 0
         self.refresh_interval = 5  # seconds
-    
+
     def refresh(self):
         """Refresh the socket-to-process mapping"""
         current_time = time.time()
         if current_time - self.last_refresh < self.refresh_interval:
             return
-        
         self.last_refresh = current_time
         self.socket_to_process = {}
-        
         # For Linux: get TCP socket info
         try:
             # Parse /proc/net/tcp for IPv4 TCP connections
@@ -261,11 +243,9 @@ class SocketProcessMapper:
                     remote = parts[2]
                     uid = int(parts[7])
                     inode = parts[9]
-                    
                     # Convert hex addresses to decimal
                     local_ip, local_port = self._hex_to_ip_port(local)
                     remote_ip, remote_port = self._hex_to_ip_port(remote)
-                    
                     # Store by inode for later process matching
                     self.socket_to_process[inode] = {
                         'local': (local_ip, local_port),
@@ -275,7 +255,6 @@ class SocketProcessMapper:
                         'pid': None,
                         'process': None
                     }
-                    
             # Parse /proc/net/udp for IPv4 UDP connections
             with open('/proc/net/udp', 'r') as f:
                 lines = f.readlines()[1:]  # Skip header
@@ -285,11 +264,9 @@ class SocketProcessMapper:
                     remote = parts[2]
                     uid = int(parts[7])
                     inode = parts[9]
-                    
                     # Convert hex addresses to decimal
                     local_ip, local_port = self._hex_to_ip_port(local)
                     remote_ip, remote_port = self._hex_to_ip_port(remote)
-                    
                     # Store by inode
                     self.socket_to_process[inode] = {
                         'local': (local_ip, local_port),
@@ -299,12 +276,10 @@ class SocketProcessMapper:
                         'pid': None,
                         'process': None
                     }
-                    
             # Find process information by scanning /proc/[pid]/fd
             for pid in os.listdir('/proc'):
                 if not pid.isdigit():
                     continue
-                    
                 try:
                     fd_dir = f'/proc/{pid}/fd'
                     for fd in os.listdir(fd_dir):
@@ -320,48 +295,39 @@ class SocketProcessMapper:
                                         # Get process name
                                         with open(f'/proc/{pid}/comm', 'r') as f:
                                             process_name = f.read().strip()
-                                        
                                         self.socket_to_process[inode]['pid'] = pid
                                         self.socket_to_process[inode]['process'] = process_name
                         except (FileNotFoundError, PermissionError):
                             pass
                 except (FileNotFoundError, PermissionError):
                     pass
-            
         except Exception as e:
             print(f"Error refreshing socket-to-process mapping: {e}")
-    
+
     def _hex_to_ip_port(self, hex_str):
         """Convert a hex string like "0100007F:1234" to IP and port"""
         ip_hex, port_hex = hex_str.split(':')
-        
         # Convert hex IP (stored in little-endian) to decimal
         ip_parts = [int(ip_hex[i:i+2], 16) for i in range(6, -2, -2)]
         ip = '.'.join(map(str, ip_parts))
-        
         # Convert hex port to decimal
         port = int(port_hex, 16)
-        
         return ip, port
-    
+
     def get_process_info(self, proto, src_ip, src_port, dst_ip, dst_port):
         """Try to find process info for a connection"""
         self.refresh()
-        
         # Convert protocol number to string
         proto_str = 'tcp' if proto == 6 else 'udp' if proto == 17 else str(proto)
         if proto_str not in ('tcp', 'udp'):
             return None
-            
         # Try both directions (source→dest and dest→source)
         for socket_info in self.socket_to_process.values():
             if socket_info['proto'] != proto_str:
                 continue
-                
             # Check if this socket matches our connection (either direction)
             local_ip, local_port = socket_info['local']
             remote_ip, remote_port = socket_info['remote']
-            
             # Check direct match
             if ((local_ip == src_ip and local_port == src_port and
                  remote_ip == dst_ip and remote_port == dst_port) or
@@ -371,14 +337,12 @@ class SocketProcessMapper:
                     'pid': socket_info['pid'],
                     'process': socket_info['process']
                 }
-                
             # Also check for wildcard matches (0.0.0.0 or any port 0)
             if local_ip == '0.0.0.0' and local_port == src_port:
                 return {
                     'pid': socket_info['pid'],
                     'process': socket_info['process']
                 }
-                
         return None
 
 class DnsTracker:
@@ -387,11 +351,10 @@ class DnsTracker:
         self.max_entries = max_entries
         self.queries = {}  # id -> query
         self.recent_dns = deque(maxlen=max_entries)  # recent resolved queries
-    
+
     def add_dns_packet(self, src_ip, src_port, dst_ip, dst_port, dns_data):
         if not dns_data:
             return
-            
         # Store query
         if not dns_data['is_response']:
             self.queries[dns_data['id']] = {
@@ -418,7 +381,7 @@ class DnsTracker:
                     'answers': dns_data['answers'],
                     'time': time.time()
                 })
-    
+
     def get_recent_queries(self, count=5):
         return list(self.recent_dns)[:count]
 
@@ -429,32 +392,28 @@ class ConnectionTracker:
         self.start_time = time.time()
         self.process_mapper = SocketProcessMapper()
         self.dns_tracker = DnsTracker()
-    
+
     def add_packet(self, proto, src_ip, src_port, dst_ip, dst_port, size, packet_data=None):
         # Create bidirectional key
         if f"{src_ip}:{src_port}" < f"{dst_ip}:{dst_port}":
             key = (proto, src_ip, src_port, dst_ip, dst_port)
         else:
             key = (proto, dst_ip, dst_port, src_ip, src_port)
-            
         # Update bytes and packet count
         self.connections[key][0] += size
         self.connections[key][1] += 1
-        
         # Try to identify the process if not already identified
         if self.connections[key][2] is None:
             self.connections[key][2] = self.process_mapper.get_process_info(
                 proto, src_ip, src_port, dst_ip, dst_port)
-        
         # Track DNS queries/responses
         if proto == 17 and (src_port == 53 or dst_port == 53) and packet_data:
             dns_data = parse_dns(packet_data)
             if dns_data:
                 self.dns_tracker.add_dns_packet(src_ip, src_port, dst_ip, dst_port, dns_data)
-    
-    def print_report(self, count=20, process_filter=None, group_by_process=False, dns_count=5):
+
+    def print_report(self, count=20, process_filter=None, group_by_process=False, dns_count=5, line_limit=None):
         duration = time.time() - self.start_time
-        
         # Filter connections by process if specified
         filtered_connections = self.connections.items()
         if process_filter:
@@ -462,64 +421,88 @@ class ConnectionTracker:
                 (conn, stats) for conn, stats in filtered_connections
                 if stats[2] and stats[2]['process'] and process_filter.lower() in stats[2]['process'].lower()
             ]
-        
         # Calculate totals for the filtered set
         total_bytes = sum(conn[0] for _, conn in filtered_connections)
         total_packets = sum(conn[1] for _, conn in filtered_connections)
         bytes_per_second = total_bytes / duration if duration > 0 else 0
-        
         # Sort connections by total bytes (descending)
         sorted_connections = sorted(
-            filtered_connections, 
-            key=lambda x: x[1][0], 
+            filtered_connections,
+            key=lambda x: x[1][0],
             reverse=True
         )
         
         # Clear screen and print header
         print("\033c", end="")  # Clear screen
+        # Initialize line counter for limiting output
+        lines_printed = 0
         
         # Print fancy header
         print(f"{Colors.BOLD}{Colors.UNDERLINE}Network Traffic Summary{Colors.RESET}")
+        lines_printed += 1
         print(f"Duration: {Colors.CYAN}{duration:.1f} seconds{Colors.RESET}")
-        
+        lines_printed += 1
         # Print total stats with color based on bandwidth
         bandwidth_color = get_bandwidth_color(bytes_per_second)
         print(f"Total: {bandwidth_color}{format_bytes(total_bytes)}{Colors.RESET} in {Colors.BOLD}{total_packets}{Colors.RESET} packets")
+        lines_printed += 1
         print(f"Rate: {bandwidth_color}{format_bytes(bytes_per_second)}/s{Colors.RESET} ({Colors.BOLD}{total_packets/duration:.1f}{Colors.RESET} packets/sec)")
+        lines_printed += 1
+        
+        # Check if we're already at the limit
+        if line_limit and lines_printed >= line_limit:
+            return
         
         # Group by process if requested
         if group_by_process:
-            self._print_grouped_by_process(sorted_connections, count)
+            self._print_grouped_by_process(sorted_connections, count, line_limit, lines_printed if line_limit else None)
         else:
-            self._print_flat_list(sorted_connections, count)
-            
-        # Print recent DNS queries
-        recent_queries = self.dns_tracker.get_recent_queries(dns_count)
-        if recent_queries:
-            print(f"\n{Colors.BOLD}{Colors.UNDERLINE}Latest DNS Queries:{Colors.RESET}")
-            for i, query in enumerate(recent_queries):
-                timestamp = time.strftime("%H:%M:%S", time.localtime(query['time']))
-                answers_str = ", ".join(query['answers']) if query['answers'] else "No answer"
-                print(f"{Colors.CYAN}[{timestamp}]{Colors.RESET} {Colors.YELLOW}{query['query']}{Colors.RESET} → {Colors.GREEN}{answers_str}{Colors.RESET}")
-    
-    def _print_flat_list(self, sorted_connections, count):
+            remaining_lines = self._print_flat_list(sorted_connections, count, line_limit, lines_printed if line_limit else None)
+            if line_limit and remaining_lines:
+                lines_printed = remaining_lines
+        
+        # Print recent DNS queries if space remains
+        if not line_limit or (line_limit and lines_printed < line_limit):
+            recent_queries = self.dns_tracker.get_recent_queries(dns_count)
+            if recent_queries:
+                print(f"\n{Colors.BOLD}{Colors.UNDERLINE}Latest DNS Queries:{Colors.RESET}")
+                lines_printed += 2  # Count header and blank line
+                
+                # Calculate how many DNS entries we can show
+                dns_entries_to_show = min(len(recent_queries), 
+                                        line_limit - lines_printed if line_limit else len(recent_queries))
+                
+                for i, query in enumerate(recent_queries[:dns_entries_to_show]):
+                    if line_limit and lines_printed >= line_limit:
+                        break
+                    timestamp = time.strftime("%H:%M:%S", time.localtime(query['time']))
+                    answers_str = ", ".join(query['answers']) if query['answers'] else "No answer"
+                    print(f"{Colors.CYAN}[{timestamp}]{Colors.RESET} {Colors.YELLOW}{query['query']}{Colors.RESET} → {Colors.GREEN}{answers_str}{Colors.RESET}")
+                    lines_printed += 1
+
+    def _print_flat_list(self, sorted_connections, count, line_limit=None, lines_printed=0):
         """Print a flat list of connections sorted by bytes"""
         print(f"\n{Colors.BOLD}{Colors.UNDERLINE}Active Network Sockets (sorted by total bytes):{Colors.RESET}")
         print(f"{Colors.YELLOW}{'─' * 100}{Colors.RESET}")
+        
+        if line_limit:
+            lines_printed += 2  # Count header and separator
+            if lines_printed >= line_limit:
+                return lines_printed
         
         # Print each connection's stats
         displayed = 0
         for conn, stats in sorted_connections:
             if displayed >= count:
                 break
+            if line_limit and lines_printed >= line_limit:
+                break
                 
             proto, src_ip, src_port, dst_ip, dst_port = conn
             total_size, packet_count, process_info = stats
-            
             proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(proto, f"IP{proto}")
             proto_color = get_protocol_color(proto_name)
             process_name = f"{Colors.MAGENTA}[{process_info['process']}]{Colors.RESET}" if process_info and process_info['process'] else ""
-            
             if proto in (6, 17):  # TCP or UDP
                 print(f"{proto_color}{proto_name:4}{Colors.RESET} Src: {Colors.CYAN}{src_ip:15}:{src_port:<6}{Colors.RESET} → "
                       f"Dst: {Colors.CYAN}{dst_ip:15}:{dst_port:<6}{Colors.RESET} "
@@ -530,15 +513,17 @@ class ConnectionTracker:
                       f"Dst: {Colors.CYAN}{dst_ip:15}       {Colors.RESET} "
                       f"Bytes: {Colors.YELLOW}{format_bytes(total_size)}{Colors.RESET} "
                       f"Count: {Colors.GREEN}{packet_count:6}{Colors.RESET} {process_name}")
-            
             displayed += 1
-    
-    def _print_grouped_by_process(self, sorted_connections, count):
+            if line_limit:
+                lines_printed += 1
+                
+        return lines_printed if line_limit else None
+
+    def _print_grouped_by_process(self, sorted_connections, count, line_limit=None, lines_printed=0):
         """Print connections grouped by process with summaries"""
         # Group connections by process
         process_groups = defaultdict(list)
         unknown_connections = []
-        
         for conn, stats in sorted_connections:
             process_info = stats[2]
             if process_info and process_info['process']:
@@ -556,16 +541,24 @@ class ConnectionTracker:
         print(f"\n{Colors.BOLD}{Colors.UNDERLINE}Network Connections by Process (sorted by total bytes):{Colors.RESET}")
         print(f"{Colors.YELLOW}{'═' * 100}{Colors.RESET}")
         
+        if line_limit:
+            lines_printed += 2  # Count header and separator
+            if lines_printed >= line_limit:
+                return lines_printed
+        
         # Print each process group
         processes_shown = 0
         for process_name, total_process_bytes in sorted_processes:
             if processes_shown >= count:
+                break
+            if line_limit and lines_printed + 3 > line_limit:  # Need at least 3 lines for process header
                 break
                 
             process_connections = process_groups[process_name]
             packet_count = sum(stats[1] for _, stats in process_connections)
             
             # Print process summary
+            duration = time.time() - self.start_time
             bytes_per_sec = total_process_bytes / duration if duration > 0 else 0
             bandwidth_color = get_bandwidth_color(bytes_per_sec)
             
@@ -574,12 +567,19 @@ class ConnectionTracker:
                   f"{Colors.BOLD}{packet_count}{Colors.RESET} packets "
                   f"({bandwidth_color}{format_bytes(bytes_per_sec)}/s{Colors.RESET})")
             print(f"{Colors.YELLOW}{'─' * 100}{Colors.RESET}")
+            lines_printed += 2
             
-            # Print top 5 connections for this process
-            for conn, stats in sorted(process_connections, key=lambda x: x[1][0], reverse=True)[:5]:
+            # Print top connections for this process
+            connections_to_show = min(5, len(process_connections))
+            if line_limit and lines_printed + connections_to_show > line_limit:
+                connections_to_show = line_limit - lines_printed
+            
+            for i, (conn, stats) in enumerate(sorted(process_connections, key=lambda x: x[1][0], reverse=True)):
+                if i >= connections_to_show:
+                    break
+                
                 proto, src_ip, src_port, dst_ip, dst_port = conn
                 total_size, packet_count, _ = stats
-                
                 proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(proto, f"IP{proto}")
                 proto_color = get_protocol_color(proto_name)
                 
@@ -593,13 +593,18 @@ class ConnectionTracker:
                           f"{Colors.CYAN}{dst_ip:15}       {Colors.RESET} "
                           f"Bytes: {Colors.YELLOW}{format_bytes(total_size)}{Colors.RESET} "
                           f"Count: {Colors.GREEN}{packet_count:6}{Colors.RESET}")
-            
+                lines_printed += 1
+                
             processes_shown += 1
         
         # If space remains, show unidentified connections
-        if processes_shown < count and unknown_connections:
+        if processes_shown < count and unknown_connections and (not line_limit or lines_printed < line_limit):
+            if line_limit and lines_printed + 3 > line_limit:  # Need at least 3 lines for unknown header
+                return lines_printed
+                
             unknown_bytes = sum(stats[0] for _, stats in unknown_connections)
             unknown_packets = sum(stats[1] for _, stats in unknown_connections)
+            duration = time.time() - self.start_time
             bytes_per_sec = unknown_bytes / duration if duration > 0 else 0
             bandwidth_color = get_bandwidth_color(bytes_per_sec)
             
@@ -608,12 +613,19 @@ class ConnectionTracker:
                   f"{Colors.BOLD}{unknown_packets}{Colors.RESET} packets "
                   f"({bandwidth_color}{format_bytes(bytes_per_sec)}/s{Colors.RESET})")
             print(f"{Colors.YELLOW}{'─' * 100}{Colors.RESET}")
+            lines_printed += 2
             
-            # Print top 5 unknown connections
-            for conn, stats in sorted(unknown_connections, key=lambda x: x[1][0], reverse=True)[:5]:
+            # Print top unknown connections
+            connections_to_show = min(5, len(unknown_connections))
+            if line_limit and lines_printed + connections_to_show > line_limit:
+                connections_to_show = line_limit - lines_printed
+            
+            for i, (conn, stats) in enumerate(sorted(unknown_connections, key=lambda x: x[1][0], reverse=True)):
+                if i >= connections_to_show:
+                    break
+                
                 proto, src_ip, src_port, dst_ip, dst_port = conn
                 total_size, packet_count, _ = stats
-                
                 proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(proto, f"IP{proto}")
                 proto_color = get_protocol_color(proto_name)
                 
@@ -627,13 +639,17 @@ class ConnectionTracker:
                           f"{Colors.CYAN}{dst_ip:15}       {Colors.RESET} "
                           f"Bytes: {Colors.YELLOW}{format_bytes(total_size)}{Colors.RESET} "
                           f"Count: {Colors.GREEN}{packet_count:6}{Colors.RESET}")
+                lines_printed += 1
+                
+        return lines_printed
 
 # Set up the connection tracker
 tracker = ConnectionTracker()
 
 # Handle periodic reporting with signal
 def print_report(signum=None, frame=None):
-    tracker.print_report(args.count, args.process, args.group, args.dns_count)
+    line_limit = 60 if args.truncate_output else None
+    tracker.print_report(args.count, args.process, args.group, args.dns_count, line_limit)
     # Set up the next alarm if not triggered by Ctrl+C
     if signum == signal.SIGALRM:
         signal.alarm(args.time)
@@ -645,6 +661,10 @@ signal.signal(signal.SIGINT, lambda s, f: (print_report(), sys.exit(0)))
 print(f"{Colors.GREEN}Network Traffic Analyzer with Process Information - Press Ctrl+C to exit{Colors.RESET}")
 if args.no_local:
     print(f"{Colors.YELLOW}Excluding localhost traffic (127.0.0.0/8){Colors.RESET}")
+if args.exclude_lan:
+    print(f"{Colors.YELLOW}Excluding LAN traffic (192.168.0.0/16 and 10.0.0.0/8){Colors.RESET}")
+if args.truncate_output:
+    print(f"{Colors.YELLOW}Output limited to 60 lines{Colors.RESET}")
 if args.process:
     print(f"{Colors.YELLOW}Filtering for process: {args.process}{Colors.RESET}")
 if args.group:
@@ -657,18 +677,17 @@ signal.alarm(args.time)
 try:
     while True:
         packet, addr = s.recvfrom(65535)
-        
         # Parse Ethernet header
         eth_protocol, src_mac, dest_mac, ip_packet = parse_ethernet(packet)
-        
         # Handle IPv4 packets (type 0x0800)
         if eth_protocol == 8:  # IPv4
             protocol, src_addr, dst_addr, transport_packet, ip_total_len = parse_ip(ip_packet)
-            
             # Skip localhost traffic if --no-local is specified
             if args.no_local and is_local_traffic(src_addr, dst_addr):
                 continue
-            
+            # Skip LAN traffic if --exclude-lan is specified
+            if args.exclude_lan and is_lan_traffic(src_addr, dst_addr):
+                continue
             # TCP or UDP: Get port information
             if protocol == 6:  # TCP
                 src_port, dst_port = parse_tcp(transport_packet)
@@ -678,7 +697,6 @@ try:
                 tracker.add_packet(protocol, src_addr, src_port, dst_addr, dst_port, ip_total_len, transport_packet)
             else:  # ICMP or other IP protocols
                 tracker.add_packet(protocol, src_addr, 0, dst_addr, 0, ip_total_len)
-        
 except KeyboardInterrupt:
     # Handler will print report and exit
     pass
