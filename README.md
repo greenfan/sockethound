@@ -40,11 +40,13 @@ sudo python3 sockethound.py [options]
 
 ### Options
 - `-n, --no-local`: Exclude localhost traffic (127.0.0.0/8).
+- `-e`: Exclude localhost LAN traffic (192.168.0.0/16 10.0.0.0/8 172.7.0.0/16).
 - `-t, --time <seconds>`: Report interval (default: 10).
 - `-c, --count <number>`: Number of connections/processes to display (default: 20).
 - `-p, --process <name>`: Filter by process name (e.g., "chrome").
 - `-g, --group`: Group connections by process.
 - `-d, --dns-count <number>`: Number of recent DNS queries to show (default: 5).
+- `-r`, : resolve IP addresses and display hostnames.
 
 ### Sample Output:
 
