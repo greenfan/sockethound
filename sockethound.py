@@ -13,6 +13,10 @@ import math
 import random
 import threading
 
+
+## TODO RESOLVE INCREMENTS per PID
+
+
 parser = argparse.ArgumentParser(description='SocketHound Python Protocol Analyzer more at github.com/greenfan written by RND www.russelldwyer.com')
 parser.add_argument('-n', '--no-local', action='store_true',
                     help='Exclude local traffic (127.0.0.0/8)')
