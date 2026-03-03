@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""UNPA NetHound - privileged and unprivileged network traffic analyzer.
+
+Version: 1.3
+"""
 import socket
 import struct
 import time
@@ -30,6 +34,7 @@ except ImportError:
 IS_MACOS = platform.system() == 'Darwin'
 IS_LINUX = platform.system() == 'Linux'
 ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*m')
+APP_VERSION = "1.3"
 
 def parse_ip_or_cidr(value):
     try:
@@ -98,6 +103,10 @@ parser = argparse.ArgumentParser(
         "  python3 unpa.py -ee 208.10.10.11 -ee 207.10.0.0/16\n"
         "  python3 unpa.py -ii 134.0.0.0/8\n"
         "  python3 unpa.py -ii google.com\n"
+        "\n"
+        "Runtime shortcuts:\n"
+        "  x -> toggle truncation on/off (off shows full scroll-safe output)\n"
+        "  - -> toggle DNS panel expansion (privileged mode only)\n"
     ),
 )
 parser.add_argument('-n', '--no-local', action='store_true',
@@ -112,8 +121,6 @@ parser.add_argument('-g', '--group', action='store_true',
                     help='Group output by process name instead of a flat connection list.')
 parser.add_argument('-d', '--dns-count', type=int, default=5,
                     help='Number of recent DNS query entries shown in report output (default: 5).')
-parser.add_argument('-xx', '--truncate-output', action='store_true',
-                    help='Limit each report to 60 lines.')
 parser.add_argument('-e', '--exclude-lan', action='store_true',
                     help='Exclude LAN-to-LAN traffic in 192.168.0.0/16, 172.0.0.0/8, and 10.0.0.0/8. Port 53 bypass applies unless -nodns is set.')
 parser.add_argument('-ee', '--exclude-extra', action='append', default=[], type=parse_ip_or_cidr, metavar='IP_OR_CIDR',
@@ -130,6 +137,8 @@ parser.add_argument('-i', '--interface', type=str, default=None,
                     help='Capture interface (macOS examples: en0/en1; Linux examples: eth0/wlan0).')
 parser.add_argument('-m', '--merge-highport-sockets', action='store_true',
                     help='Merge sockets that only differ by high src/dst ports (>35000) when those ports are in a close range (gap <= 9).')
+parser.add_argument('--version', action='version', version=f'%(prog)s {APP_VERSION}',
+                    help='Show program version and exit.')
 
 cli_args = sys.argv[1:]
 if len(cli_args) == 1 and cli_args[0] in ('-o', '--default-no-resolve'):
@@ -557,7 +566,7 @@ def get_protocol_color(proto):
         return Colors.BLUE
     elif proto == 'UDP':
         return Colors.GREEN
-    elif proto == 'ICMP':
+    elif proto in ('ICMP', 'ICMPv6'):
         return Colors.YELLOW
     elif proto.startswith('IP'):
         return Colors.MAGENTA
@@ -841,6 +850,7 @@ class ConnectionTracker:
         self.idle_toggle = defaultdict(int)
         self.ip_cache = {}
         self.expand_dns_queries = True
+        self.truncation_enabled = True
         self.last_unpriv_poll_time = time.time()
         self.unpriv_prev_io = defaultdict(lambda: (0, 0))
         # On macOS in unprivileged mode, per-process io counters are not reliable
@@ -868,7 +878,7 @@ class ConnectionTracker:
 
     def _format_rate_metric(self, value):
         if self.unprivileged_mode:
-            return f"{value:,.1f} pps"
+            return f"{value:,.1f} packets per second"
         return f"{format_bytes(value)}/s"
 
     def _format_socket_rate_field(self, value):
@@ -876,6 +886,12 @@ class ConnectionTracker:
         if self.unprivileged_mode:
             return f"{value:>5.1f} pps"
         return self._format_rate_metric(value)
+
+    def _protocol_display(self, proto):
+        proto_name = {6: "TCP", 17: "UDP", 1: "ICMP", 58: "ICMPv6"}.get(proto, f"IP{proto}")
+        proto_color = get_protocol_color(proto_name)
+        # Fixed width keeps row alignment stable even for longer labels like ICMPv6.
+        return proto_name, proto_color, f"{proto_name:<6}"
 
     def _format_duration(self, duration_seconds):
         if duration_seconds > 3600:
@@ -1288,25 +1304,34 @@ class ConnectionTracker:
         )
         return display
 
-    def print_report(self, count=20, process_filter=None, group_by_process=False, dns_count=5, line_limit=None):
-        print("\033c", end="")
+    def print_report(self, count=20, process_filter=None, group_by_process=False, dns_count=5, line_limit=None, no_truncation=False):
+        if no_truncation:
+            timestamp = time.strftime("%H:%M:%S")
+            print(f"\n{Colors.GREY}--- report refresh {timestamp} ---{Colors.RESET}")
+        else:
+            print("\033c", end="")
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            self._render_report_content(count, process_filter, group_by_process, dns_count, line_limit)
-        self._print_framed_output(buffer.getvalue().splitlines())
+            self._render_report_content(count, process_filter, group_by_process, dns_count, line_limit, no_truncation)
+        self._print_framed_output(
+            buffer.getvalue().splitlines(),
+            clip_to_terminal=not no_truncation,
+            sticky_footer=not no_truncation,
+        )
 
-    def _print_framed_output(self, lines):
+    def _print_framed_output(self, lines, clip_to_terminal=True, sticky_footer=True):
         if not lines:
             return
         term_size = shutil.get_terminal_size(fallback=(160, 40))
-        # Keep output within viewport so each refresh stays stable and does not scroll.
-        # Reserve one terminal row for the bottom footer.
-        max_content_rows = max(3, term_size.lines - 3)
-        if len(lines) > max_content_rows:
-            hidden = len(lines) - (max_content_rows - 1)
-            lines = lines[:max_content_rows - 1] + [
-                f"{Colors.SOFT_OLIVE}… clipped {hidden} lines to fit terminal height{Colors.RESET}"
-            ]
+        if clip_to_terminal:
+            # Keep output within viewport so each refresh stays stable and does not scroll.
+            # Reserve one terminal row for the bottom footer.
+            max_content_rows = max(3, term_size.lines - 3)
+            if len(lines) > max_content_rows:
+                hidden = len(lines) - (max_content_rows - 1)
+                lines = lines[:max_content_rows - 1] + [
+                    f"{Colors.SOFT_OLIVE}… clipped {hidden} lines to fit terminal height{Colors.RESET}"
+                ]
         min_width = 64
         max_width = 148
         content_width = max(visible_text_len(line) for line in lines)
@@ -1317,10 +1342,11 @@ class ConnectionTracker:
         for line in lines:
             print(f"{border_color}│{Colors.RESET} {fit_visible(line, content_width)} {border_color}│{Colors.RESET}")
         print(f"{border_color}╰{'─' * (content_width + 2)}╯{Colors.RESET}")
-        self._print_bottom_footer(term_size)
+        if sticky_footer:
+            self._print_bottom_footer(term_size)
 
     def _print_bottom_footer(self, term_size):
-        footer_plain = " xxx I unpa nethound version 1.2 I xxx "
+        footer_plain = f" xxx I unpa nethound version {APP_VERSION} I xxx "
         footer_width = len(footer_plain)
         if term_size.columns <= 2:
             return
@@ -1333,7 +1359,7 @@ class ConnectionTracker:
         sys.stdout.write(f"\033[{term_size.lines};1H\033[2K{' ' * left_pad}{footer_colored}{Colors.RESET}")
         sys.stdout.flush()
 
-    def _render_report_content(self, count=20, process_filter=None, group_by_process=False, dns_count=5, line_limit=None):
+    def _render_report_content(self, count=20, process_filter=None, group_by_process=False, dns_count=5, line_limit=None, no_truncation=False):
         self._update_bandwidth_measurements()
         duration = time.time() - self.start_time
         filtered_connections = list(self.connections.items())
@@ -1361,27 +1387,34 @@ class ConnectionTracker:
 
         # Build left summary box rows
         left_rows = [f"{Colors.BOLD}{Colors.HEADER_MOSS}┌{'─' * (box_width - 2)}┐{Colors.RESET}"]
-        platform_str = f"Platform: {Colors.CYAN}{platform.system()} {platform.release()}{Colors.RESET}"
+        platform_str = f"{Colors.WHITE}Platform: {Colors.CYAN}{platform.system()} {platform.release()}{Colors.RESET}"
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET} {pad_visible(platform_str, left_inner_width - 1)}{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}")
-        duration_str = f"Duration: {Colors.CYAN}{self._format_duration(duration)}{Colors.RESET}"
+        duration_str = f"{Colors.WHITE}Duration: {Colors.CYAN}{self._format_duration(duration)}{Colors.RESET}"
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET} {pad_visible(duration_str, left_inner_width - 1)}{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}")
         if self.unprivileged_mode:
             total_str = (
-                f" Cumulative Total: {Colors.MOSS_GREEN}{int(total_packets):,}{Colors.RESET} total packets"
+                f" {Colors.WHITE}Cumulative Total: {Colors.MOSS_GREEN}{int(total_packets):,}{Colors.RESET}{Colors.WHITE} total packets{Colors.RESET}"
             )
         else:
             total_str = (
-                f" Cumulative Total: {Colors.MOSS_GREEN}{self._format_total_metric(total_bytes)}{Colors.RESET} "
-                f"in {Colors.MOSS_GREEN}{int(total_packets):,}{Colors.RESET} packets"
+                f" {Colors.WHITE}Cumulative Total: {Colors.MOSS_GREEN}{self._format_total_metric(total_bytes)}{Colors.RESET} "
+                f"{Colors.WHITE}in {Colors.MOSS_GREEN}{int(total_packets):,}{Colors.RESET}{Colors.WHITE} packets{Colors.RESET}"
             )
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}{pad_visible(total_str, left_inner_width)}{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}")
         current_color = get_unpriv_visual_color(self.current_total_bw) if self.unprivileged_mode else get_visual_color((self.current_total_bw * 8) / 1000)
         peak_color = get_unpriv_visual_color(self.peak_total_bw) if self.unprivileged_mode else get_visual_color((self.peak_total_bw * 8) / 1000)
-        rates_str = f" Current: {current_color}{self._format_rate_metric(self.current_total_bw)}{Colors.RESET}"
+        if self.unprivileged_mode:
+            current_rate_value = f"{self.current_total_bw:>8,.1f}"
+            rates_str = (
+                f" {Colors.WHITE}Current: {current_color}{current_rate_value}{Colors.RESET}"
+                f"{Colors.WHITE} packets per second{Colors.RESET}"
+            )
+        else:
+            rates_str = f" {Colors.WHITE}Current: {current_color}{self._format_rate_metric(self.current_total_bw)}{Colors.RESET}"
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}{pad_visible(rates_str, left_inner_width)}{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}")
         conn_str = (
-            f" Sniffed Connections: {Colors.YELLOW}{len(self.connections)}{Colors.RESET}"
-            f"  Peak: {peak_color}{self._format_rate_metric(self.peak_total_bw)}{Colors.RESET}"
+            f" {Colors.WHITE}Sniffed Connections: {Colors.YELLOW}{len(self.connections)}{Colors.RESET}"
+            f"{Colors.WHITE}  Peak: {peak_color}{self._format_rate_metric(self.peak_total_bw)}{Colors.RESET}"
         )
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}{pad_visible(conn_str, left_inner_width)}{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}")
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}└{'─' * (box_width - 2)}┘{Colors.RESET}")
@@ -1436,7 +1469,8 @@ class ConnectionTracker:
                 display_histories,
                 count,
                 line_limit,
-                lines_printed if line_limit else None
+                lines_printed if line_limit else None,
+                no_truncation
             )
         else:
             remaining_lines = self._print_flat_list(
@@ -1451,7 +1485,10 @@ class ConnectionTracker:
                 lines_printed = remaining_lines
 
     def _process_header_text(self, process_label, packet_count):
-        return f"[{process_label}] • Total Packet Count: {int(packet_count):,}"
+        return (
+            f"{Colors.CYAN}[{Colors.LIGHT_PURPLE}{process_label}{Colors.CYAN}] • "
+            f"Total Packet Count [ {Colors.LIGHT_PURPLE}{int(packet_count):,}{Colors.CYAN} ]"
+        )
 
     def _print_flat_list(self, sorted_connections, display_current_bandwidths, display_histories, count, line_limit=None, lines_printed=0):
         if line_limit:
@@ -1467,8 +1504,7 @@ class ConnectionTracker:
             proto, src_ip, src_port, dst_ip, dst_port = conn
             endpoint_width = 20
             total_size, packet_count, process_info = stats
-            proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(proto, f"IP{proto}")
-            proto_color = get_protocol_color(proto_name)
+            proto_name, proto_color, proto_display = self._protocol_display(proto)
             if process_info and process_info['process']:
                 process_name = process_info['process']
                 if len(process_name) > 15:
@@ -1494,12 +1530,12 @@ class ConnectionTracker:
                 src_display = src_display[:endpoint_width]
                 dst_display = dst_display[:endpoint_width]
             if proto in (6, 17):
-                print(f"{proto_color}{proto_name:4}{Colors.RESET} Src: {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  ⥄  "
+                print(f"{proto_color}{proto_display}{Colors.RESET} Src: {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  {Colors.WHITE}⥄{Colors.RESET}  "
                       f"Dst: {Colors.CYAN}{dst_display:20}:{dst_port:<9}{Colors.RESET}  "
                       f"{process_display} "
                       f"{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
             else:
-                print(f"{proto_color}{proto_name:4}{Colors.RESET} Src: {Colors.CYAN}{src_display:20}          {Colors.RESET}  ⥄  "
+                print(f"{proto_color}{proto_display}{Colors.RESET} Src: {Colors.CYAN}{src_display:20}          {Colors.RESET}  {Colors.WHITE}⥄{Colors.RESET}  "
                       f"Dst: {Colors.CYAN}{dst_display:20}          {Colors.RESET}  "
                       f"{process_display} "
                       f"{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
@@ -1508,7 +1544,7 @@ class ConnectionTracker:
                 lines_printed += 1
         return lines_printed if line_limit else None
 
-    def _print_grouped_by_process(self, sorted_connections, display_current_bandwidths, display_histories, count, line_limit=None, lines_printed=0):
+    def _print_grouped_by_process(self, sorted_connections, display_current_bandwidths, display_histories, count, line_limit=None, lines_printed=0, no_truncation=False):
         header_indent = " " * 20
         process_groups = defaultdict(list)
         unknown_connections = []
@@ -1541,7 +1577,7 @@ class ConnectionTracker:
             bytes_display = f"{bandwidth_color}{self._format_total_metric(total_process_bytes):>16}{Colors.RESET}"
             process_bw_display = f"{process_bw_color}{self._format_rate_metric(current_bw)}{Colors.RESET}"
             sorted_process_connections = sorted(process_connections, key=lambda x: x[1][0], reverse=True)
-            connections_to_show = min(5, len(sorted_process_connections))
+            connections_to_show = len(sorted_process_connections) if no_truncation else min(5, len(sorted_process_connections))
             if line_limit:
                 remaining = line_limit - lines_printed
                 if remaining <= 2:
@@ -1549,9 +1585,9 @@ class ConnectionTracker:
                 connections_to_show = min(connections_to_show, max(0, remaining - 2))
                 if connections_to_show == 0:
                     break
-            process_label = f"{Colors.LIGHT_PURPLE}{process_name}{Colors.RESET}"
+            process_label = process_name
             header_text = self._process_header_text(process_label, packet_count)
-            print(f"{Colors.BOLD}{Colors.WHITE}{header_indent}{header_text}{Colors.RESET}")
+            print(f"{Colors.BOLD}{header_indent}{header_text}{Colors.RESET}")
             lines_printed += 1
             for i, (conn, stats) in enumerate(sorted_process_connections):
                 if i >= connections_to_show:
@@ -1559,8 +1595,7 @@ class ConnectionTracker:
                 proto, src_ip, src_port, dst_ip, dst_port = conn
                 endpoint_width = 20
                 total_size, packet_count, _ = stats
-                proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(proto, f"IP{proto}")
-                proto_color = get_protocol_color(proto_name)
+                proto_name, proto_color, proto_display = self._protocol_display(proto)
                 metric_text = self._format_unpriv_packet_cell(total_size) if self.unprivileged_mode else self._format_total_metric(total_size)
                 metric_pad = "  " if self.unprivileged_mode else " "
                 history_sep = "" if self.unprivileged_mode else metric_pad
@@ -1579,13 +1614,15 @@ class ConnectionTracker:
                     src_display = src_display[:endpoint_width]
                     dst_display = dst_display[:endpoint_width]
                 if proto in (6, 17):
-                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  →  "
+                    total_label = f"{Colors.WHITE}{'Total' if self.unprivileged_mode else 'Bytes'}:{Colors.RESET}"
+                    print(f"  {proto_color}{proto_display}{Colors.RESET} {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  {Colors.WHITE}→{Colors.RESET}  "
                           f"{Colors.CYAN}{dst_display:20}:{dst_port:<9}{Colors.RESET}  "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
+                          f"{total_label}{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
                 else:
-                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}          {Colors.RESET}  →  "
+                    total_label = f"{Colors.WHITE}{'Total' if self.unprivileged_mode else 'Bytes'}:{Colors.RESET}"
+                    print(f"  {proto_color}{proto_display}{Colors.RESET} {Colors.CYAN}{src_display:20}          {Colors.RESET}  {Colors.WHITE}→{Colors.RESET}  "
                           f"{Colors.CYAN}{dst_display:20} {Colors.RESET}  "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
+                          f"{total_label}{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
                 lines_printed += 1
             print()
             lines_printed += 1
@@ -1603,7 +1640,7 @@ class ConnectionTracker:
             bytes_display = f"{bandwidth_color}{self._format_total_metric(unknown_bytes):>16}{Colors.RESET}"
             unknown_bw_display = f"{unknown_bw_color}{self._format_rate_metric(current_bw)}{Colors.RESET}"
             sorted_unknown_connections = sorted(unknown_connections, key=lambda x: x[1][0], reverse=True)
-            connections_to_show = min(5, len(sorted_unknown_connections))
+            connections_to_show = len(sorted_unknown_connections) if no_truncation else min(5, len(sorted_unknown_connections))
             if line_limit:
                 remaining = line_limit - lines_printed
                 if remaining <= 2:
@@ -1611,9 +1648,9 @@ class ConnectionTracker:
                 connections_to_show = min(connections_to_show, max(0, remaining - 2))
                 if connections_to_show == 0:
                     return lines_printed
-            process_label = f"{Colors.LIGHT_PURPLE}Unknown Processes{Colors.RESET}"
+            process_label = "Unknown Processes"
             header_text = self._process_header_text(process_label, unknown_packets)
-            print(f"{Colors.BOLD}{Colors.WHITE}{header_indent}{header_text}{Colors.RESET}")
+            print(f"{Colors.BOLD}{header_indent}{header_text}{Colors.RESET}")
             lines_printed += 1
             for i, (conn, stats) in enumerate(sorted_unknown_connections):
                 if i >= connections_to_show:
@@ -1621,8 +1658,7 @@ class ConnectionTracker:
                 proto, src_ip, src_port, dst_ip, dst_port = conn
                 endpoint_width = 20
                 total_size, packet_count, _ = stats
-                proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(proto, f"IP{proto}")
-                proto_color = get_protocol_color(proto_name)
+                proto_name, proto_color, proto_display = self._protocol_display(proto)
                 metric_text = self._format_unpriv_packet_cell(total_size) if self.unprivileged_mode else self._format_total_metric(total_size)
                 metric_pad = "  " if self.unprivileged_mode else " "
                 history_sep = "" if self.unprivileged_mode else metric_pad
@@ -1641,19 +1677,21 @@ class ConnectionTracker:
                     src_display = src_display[:endpoint_width]
                     dst_display = dst_display[:endpoint_width]
                 if proto in (6, 17):
-                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  →  "
+                    total_label = f"{Colors.WHITE}{'Total' if self.unprivileged_mode else 'Bytes'}:{Colors.RESET}"
+                    print(f"  {proto_color}{proto_display}{Colors.RESET} {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  {Colors.WHITE}→{Colors.RESET}  "
                           f"{Colors.CYAN}{dst_display:20}:{dst_port:<9}{Colors.RESET}  "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
+                          f"{total_label}{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
                 else:
-                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}          {Colors.RESET}  →  "
+                    total_label = f"{Colors.WHITE}{'Total' if self.unprivileged_mode else 'Bytes'}:{Colors.RESET}"
+                    print(f"  {proto_color}{proto_display}{Colors.RESET} {Colors.CYAN}{src_display:20}          {Colors.RESET}  {Colors.WHITE}→{Colors.RESET}  "
                           f"{Colors.CYAN}{dst_display:20}          {Colors.RESET}  "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
+                          f"{total_label}{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
                 lines_printed += 1
             print()
             lines_printed += 1
         return lines_printed
 
-def enable_dns_toggle_shortcut(tracker):
+def enable_keyboard_shortcuts(tracker):
     if not sys.stdin.isatty():
         return False
     fd = sys.stdin.fileno()
@@ -1683,18 +1721,29 @@ def enable_dns_toggle_shortcut(tracker):
                 key = sys.stdin.read(1)
             except Exception:
                 continue
-            if key == '-':
+            if key.lower() == 'x':
+                tracker.truncation_enabled = not tracker.truncation_enabled
+            elif key == '-' and not tracker.unprivileged_mode:
                 tracker.expand_dns_queries = not tracker.expand_dns_queries
 
     threading.Thread(target=key_listener, daemon=True).start()
     return True
 
 tracker = ConnectionTracker(unprivileged_mode=RUN_UNPRIVILEGED)
-dns_toggle_enabled = enable_dns_toggle_shortcut(tracker) if not RUN_UNPRIVILEGED else False
+shortcuts_enabled = enable_keyboard_shortcuts(tracker)
 
 def print_report(signum=None, frame=None):
-    line_limit = 60 if args.truncate_output else None
-    tracker.print_report(args.count, args.process, args.group, args.dns_count, line_limit)
+    no_truncation = not tracker.truncation_enabled
+    display_count = sys.maxsize if no_truncation else args.count
+    line_limit = None
+    tracker.print_report(
+        display_count,
+        args.process,
+        args.group,
+        args.dns_count,
+        line_limit,
+        no_truncation=no_truncation,
+    )
     if signum == signal.SIGALRM:
         signal.alarm(args.time)
 
@@ -1702,7 +1751,7 @@ signal.signal(signal.SIGALRM, print_report)
 signal.signal(signal.SIGINT, lambda s, f: (print_report(), sys.exit(0)))
 
 mode_label = "unprivileged" if RUN_UNPRIVILEGED else "privileged"
-print(f"{Colors.GREEN}UNPA NetHound {mode_label} monitor - Press Ctrl+C to exit{Colors.RESET}")
+print(f"{Colors.GREEN}UNPA NetHound v{APP_VERSION} {mode_label} monitor - Press Ctrl+C to exit{Colors.RESET}")
 print(f"{Colors.CYAN}Running on: {platform.system()} {platform.release()}{Colors.RESET}")
 if args.no_local:
     print(f"{Colors.YELLOW}Excluding localhost traffic (localhost and 127.0.0.0/24){Colors.RESET}")
@@ -1716,8 +1765,6 @@ if args.include_only:
     print(f"{Colors.YELLOW}Including only ranges: {include_ranges_str}{Colors.RESET}")
 if args.no_dns_bypass:
     print(f"{Colors.YELLOW}DNS port 53 bypass disabled for -e filtering{Colors.RESET}")
-if args.truncate_output:
-    print(f"{Colors.YELLOW}Output limited to 60 lines{Colors.RESET}")
 if args.process:
     print(f"{Colors.YELLOW}Filtering for process: {args.process}{Colors.RESET}")
 if args.group:
@@ -1728,7 +1775,9 @@ if args.merge_highport_sockets:
     print(f"{Colors.YELLOW}Merging close-range high-port sockets enabled (-m){Colors.RESET}")
 if RUN_UNPRIVILEGED:
     print(f"{Colors.YELLOW}Unprivileged mode enabled: packet counts are used as size surrogates{Colors.RESET}")
-if dns_toggle_enabled and not RUN_UNPRIVILEGED:
+if shortcuts_enabled:
+    print(f"{Colors.YELLOW}Press 'x' to toggle truncation on/off (off = full scroll-safe output){Colors.RESET}")
+if shortcuts_enabled and not RUN_UNPRIVILEGED:
     print(f"{Colors.YELLOW}Press '-' to expand or retract Latest DNS Queries (compact max: 5){Colors.RESET}")
 print(f"{Colors.GREEN}Generating reports every {args.time} seconds...{Colors.RESET}")
 
