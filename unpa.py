@@ -128,6 +128,8 @@ parser.add_argument('-r', '--resolve', action='store_true',
                     help='Resolve endpoint IPs to names using /etc/hosts, captured DNS, and reverse lookups.')
 parser.add_argument('-i', '--interface', type=str, default=None,
                     help='Capture interface (macOS examples: en0/en1; Linux examples: eth0/wlan0).')
+parser.add_argument('-m', '--merge-highport-sockets', action='store_true',
+                    help='Merge sockets that only differ by high src/dst ports (>35000) when those ports are in a close range (gap <= 9).')
 
 cli_args = sys.argv[1:]
 if len(cli_args) == 1 and cli_args[0] in ('-o', '--default-no-resolve'):
@@ -436,19 +438,14 @@ def get_visual_color(kbps):
     if kbps == 0:
         return Colors.GREY
     elif kbps < 5:
-        return Colors.BLUE
+        return Colors.WHITE
     elif kbps < 400:
-        if kbps < 100:
-            return Colors.SPEED_SUNSET
-        elif kbps < 200:
-            return random.choice([Colors.SPEED_SUNSET, Colors.YELLOW])
-        else:
-            return Colors.YELLOW
+        return Colors.WHITE
     elif kbps < 1200:
-        if kbps < 600:
-            return Colors.YELLOW + Colors.BOLD
-        elif kbps < 900:
-            return random.choice([Colors.YELLOW + Colors.BOLD, Colors.RED])
+        if kbps < 900:
+            return Colors.WHITE + Colors.BOLD
+        elif kbps < 1050:
+            return random.choice([Colors.WHITE + Colors.BOLD, Colors.RED])
         else:
             return Colors.RED
     elif kbps < 1800:
@@ -494,17 +491,13 @@ def get_unpriv_visual_color(pps):
     if pps == 0:
         return Colors.GREY
     elif pps < 1:
-        return Colors.BLUE
+        return Colors.WHITE
     elif pps < 10:
-        if pps < 5:
-            return Colors.SPEED_SUNSET
-        if pps < 7:
-            return random.choice([Colors.SPEED_SUNSET, Colors.YELLOW])
-        return Colors.YELLOW
+        return Colors.WHITE
     elif pps < 20:
         if pps < 15:
-            return Colors.YELLOW + Colors.BOLD
-        return random.choice([Colors.YELLOW + Colors.BOLD, Colors.RED])
+            return Colors.WHITE + Colors.BOLD
+        return random.choice([Colors.WHITE + Colors.BOLD, Colors.RED])
     elif pps < 50:
         return Colors.RED + Colors.BOLD
     elif pps < 100:
@@ -807,7 +800,11 @@ class ConnectionTracker:
         self.expand_dns_queries = True
         self.last_unpriv_poll_time = time.time()
         self.unpriv_prev_io = defaultdict(lambda: (0, 0))
-        self.unpriv_has_io_counters = self._check_io_counters_support() if self.unprivileged_mode else False
+        # On macOS in unprivileged mode, per-process io counters are not reliable
+        # for network activity attribution. Use system packet counters instead.
+        self.unpriv_has_io_counters = (
+            self._check_io_counters_support() if (self.unprivileged_mode and not IS_MACOS) else False
+        )
         self.unpriv_prev_net_io = psutil.net_io_counters() if self.unprivileged_mode else None
         self.load_hosts()
         if args.resolve:
@@ -823,13 +820,17 @@ class ConnectionTracker:
 
     def _format_total_metric(self, value):
         if self.unprivileged_mode:
-            return f"{int(value):6d} pkts"
+            return f"{int(value):,} pkts"
         return format_bytes(value)
 
     def _format_rate_metric(self, value):
         if self.unprivileged_mode:
-            return f"{value:6.1f} pps"
+            return f"{value:,.1f} pps"
         return f"{format_bytes(value)}/s"
+
+    def _format_unpriv_packet_cell(self, value):
+        # Keep packet-count column compact in unprivileged mode.
+        return f"{int(value):,} pkts"[:11].ljust(11)
 
     def _metric_color_scale_value(self, value):
         if self.unprivileged_mode:
@@ -884,6 +885,8 @@ class ConnectionTracker:
             else:
                 key = (proto, dst_addr, dst_port, src_addr, src_port)
 
+            # Ensure connection appears in reports even without PID attribution.
+            _ = self.connections[key]
             all_keys.append(key)
             pid = conn_pid
             if pid:
@@ -895,6 +898,8 @@ class ConnectionTracker:
                         pname = None
                     if pname:
                         self.connections[key][2] = {'process': pname}
+            elif self.connections[key][2] is None:
+                self.connections[key][2] = {'process': 'Unknown'}
 
         if self.unpriv_has_io_counters:
             for pid, keys in proc_keys.items():
@@ -932,6 +937,130 @@ class ConnectionTracker:
     def poll(self):
         if self.unprivileged_mode:
             self._poll_unprivileged()
+
+    def _merge_history_display(self, keys):
+        width = 18
+        merged_speeds = [0.0] * width
+        for key in keys:
+            history = self.bandwidth_history.get(key, [])
+            speeds = [entry[2] for entry in history[-width:]]
+            pad = width - len(speeds)
+            for idx, speed in enumerate(speeds):
+                merged_speeds[pad + idx] += speed
+
+        merged_history = []
+        for speed in merged_speeds:
+            scaled = self._metric_color_scale_value(speed)
+            if scaled == 0:
+                merged_history.append((" ", get_unpriv_visual_color(scaled) if self.unprivileged_mode else get_visual_color(scaled), speed))
+            else:
+                if self.unprivileged_mode:
+                    merged_history.append((get_unpriv_visual_char(scaled), get_unpriv_visual_color(scaled), speed))
+                else:
+                    merged_history.append((get_visual_char(scaled), get_visual_color(scaled), speed))
+
+        return ''.join((color + char + Colors.RESET if color else char) for char, color, _ in merged_history)
+
+    def _build_display_connections(self, filtered_connections):
+        display_connections = list(filtered_connections)
+        display_current_bandwidths = {}
+        display_histories = {}
+
+        if not args.merge_highport_sockets:
+            for conn, _ in display_connections:
+                display_current_bandwidths[conn] = self.current_bandwidths.get(conn, 0)
+                display_histories[conn] = self.get_colored_bandwidth_history(conn)
+            return display_connections, display_current_bandwidths, display_histories
+
+        indexed = list(enumerate(display_connections))
+        consumed = set()
+        merged_output = []
+
+        def process_name_of(stats):
+            info = stats[2]
+            if info and info.get('process'):
+                return info['process']
+            return None
+
+        def merge_cluster(item_ids, varied_side):
+            members = [display_connections[item_id] for item_id in item_ids]
+            base_conn, base_stats = members[0]
+            proto, src_ip, src_port, dst_ip, dst_port = base_conn
+            if varied_side == 'src':
+                merged_conn = (proto, src_ip, "highports", dst_ip, dst_port)
+            else:
+                merged_conn = (proto, src_ip, src_port, dst_ip, "highports")
+
+            total_metric = sum(stats[0] for _, stats in members)
+            total_packets = sum(stats[1] for _, stats in members)
+            process_info = base_stats[2]
+            merged_stats = [total_metric, total_packets, process_info]
+            merged_output.append((merged_conn, merged_stats))
+            display_current_bandwidths[merged_conn] = sum(self.current_bandwidths.get(conn, 0) for conn, _ in members)
+            display_histories[merged_conn] = self._merge_history_display([conn for conn, _ in members])
+            consumed.update(item_ids)
+
+        # Pass 1: merge high source-port variants.
+        src_groups = defaultdict(list)
+        for idx, (conn, stats) in indexed:
+            proto, src_ip, src_port, dst_ip, dst_port = conn
+            if idx in consumed or proto not in (6, 17) or not isinstance(src_port, int):
+                continue
+            if src_port <= 35000:
+                continue
+            src_groups[(proto, src_ip, dst_ip, dst_port, process_name_of(stats))].append((idx, src_port))
+
+        for _, ports in src_groups.items():
+            ports.sort(key=lambda x: x[1])
+            cluster = [ports[0][0]] if ports else []
+            prev_port = ports[0][1] if ports else None
+            for idx, port in ports[1:]:
+                if port - prev_port <= 9:
+                    cluster.append(idx)
+                else:
+                    if len(cluster) >= 2:
+                        merge_cluster(cluster, 'src')
+                    cluster = [idx]
+                prev_port = port
+            if len(cluster) >= 2:
+                merge_cluster(cluster, 'src')
+
+        # Pass 2: merge high destination-port variants among remaining entries.
+        dst_groups = defaultdict(list)
+        for idx, (conn, stats) in indexed:
+            if idx in consumed:
+                continue
+            proto, src_ip, src_port, dst_ip, dst_port = conn
+            if proto not in (6, 17) or not isinstance(dst_port, int):
+                continue
+            if dst_port <= 35000:
+                continue
+            dst_groups[(proto, src_ip, src_port, dst_ip, process_name_of(stats))].append((idx, dst_port))
+
+        for _, ports in dst_groups.items():
+            ports.sort(key=lambda x: x[1])
+            cluster = [ports[0][0]] if ports else []
+            prev_port = ports[0][1] if ports else None
+            for idx, port in ports[1:]:
+                if port - prev_port <= 9:
+                    cluster.append(idx)
+                else:
+                    if len(cluster) >= 2:
+                        merge_cluster(cluster, 'dst')
+                    cluster = [idx]
+                prev_port = port
+            if len(cluster) >= 2:
+                merge_cluster(cluster, 'dst')
+
+        # Keep all non-merged entries unchanged.
+        for idx, (conn, stats) in indexed:
+            if idx in consumed:
+                continue
+            merged_output.append((conn, stats))
+            display_current_bandwidths[conn] = self.current_bandwidths.get(conn, 0)
+            display_histories[conn] = self.get_colored_bandwidth_history(conn)
+
+        return merged_output, display_current_bandwidths, display_histories
 
     def load_hosts(self):
         try:
@@ -1147,16 +1276,17 @@ class ConnectionTracker:
     def _render_report_content(self, count=20, process_filter=None, group_by_process=False, dns_count=5, line_limit=None):
         self._update_bandwidth_measurements()
         duration = time.time() - self.start_time
-        filtered_connections = self.connections.items()
+        filtered_connections = list(self.connections.items())
         if process_filter:
             filtered_connections = [
                 (conn, stats) for conn, stats in filtered_connections
                 if stats[2] and stats[2]['process'] and process_filter.lower() in stats[2]['process'].lower()
             ]
-        total_bytes = sum(stats[0] for _, stats in filtered_connections)
-        total_packets = sum(stats[1] for _, stats in filtered_connections)
+        display_connections, display_current_bandwidths, display_histories = self._build_display_connections(filtered_connections)
+        total_bytes = sum(stats[0] for _, stats in display_connections)
+        total_packets = sum(stats[1] for _, stats in display_connections)
         sorted_connections = sorted(
-            filtered_connections,
+            display_connections,
             key=lambda x: x[1][0],
             reverse=True
         )
@@ -1177,7 +1307,7 @@ class ConnectionTracker:
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET} {pad_visible(duration_str, left_inner_width - 1)}{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}")
         total_str = (
             f" Cumulative Total: {Colors.MOSS_GREEN}{self._format_total_metric(total_bytes)}{Colors.RESET} "
-            f"in {Colors.MOSS_GREEN}{int(total_packets)}{Colors.RESET} packets"
+            f"in {Colors.MOSS_GREEN}{int(total_packets):,}{Colors.RESET} packets"
         )
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}{pad_visible(total_str, left_inner_width)}{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}")
         current_color = get_unpriv_visual_color(self.current_total_bw) if self.unprivileged_mode else get_visual_color((self.current_total_bw * 8) / 1000)
@@ -1191,31 +1321,39 @@ class ConnectionTracker:
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}{pad_visible(conn_str, left_inner_width)}{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}")
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}└{'─' * (box_width - 2)}┘{Colors.RESET}")
 
-        # Build right DNS panel rows (shown in header area)
+        # Build right DNS panel rows (shown in header area only in privileged mode).
         base_header_rows = len(left_rows)
         min_combined_rows = base_header_rows
-        panel_query_count = max(dns_count, 12) if self.expand_dns_queries else 5
-        recent_queries = self.dns_tracker.get_recent_queries(panel_query_count)
-        shown_query_count = min(len(recent_queries), panel_query_count)
-        dns_header = f"{Colors.BOLD}{Colors.MOSS_GREEN}Latest DNS Queries{Colors.RESET}"
-        if self.expand_dns_queries and shown_query_count > 5:
-            dns_header += f" {Colors.SOFT_OLIVE}press \"-\" to show less {Colors.RESET}"
-        elif not self.expand_dns_queries:
-            dns_header += f" {Colors.SOFT_OLIVE}press \"-\" to expand{Colors.RESET}"
-        right_rows = [dns_header]
-        if recent_queries:
-            for query in recent_queries:
-                timestamp = time.strftime("%H:%M:%S", time.localtime(query['time']))
-                answer = query['answers'][0] if query['answers'] else "-"
-                dns_line = f"{timestamp} {query['query']} -> {answer}"
-                right_rows.append(f"{Colors.CYAN}{truncate_visible(dns_line, right_panel_width)}{Colors.RESET}")
+        if self.unprivileged_mode:
+            right_rows = []
+            total_rows = len(left_rows)
         else:
-            right_rows.append(f"{Colors.GREY}(no recent DNS queries){Colors.RESET}")
-        # Dynamic bump: <5 queries => no bump, 5 => +1, 6 => +2 ... up to 12 => +8.
-        extra_rows = max(0, shown_query_count - 4)
-        min_combined_rows = base_header_rows + extra_rows
-
-        total_rows = max(len(left_rows), len(right_rows), min_combined_rows)
+            panel_query_count = max(dns_count, 12) if self.expand_dns_queries else 5
+            # Hide PTR reverse lookups from display (in-addr.arpa), then backfill with next entries.
+            all_recent_queries = self.dns_tracker.get_recent_queries(self.dns_tracker.max_entries)
+            recent_queries = [
+                query for query in all_recent_queries
+                if 'in-addr.arpa' not in query.get('query', '').lower()
+            ][:panel_query_count]
+            shown_query_count = min(len(recent_queries), panel_query_count)
+            dns_header = f"{Colors.BOLD}{Colors.MOSS_GREEN}Latest DNS Queries{Colors.RESET}"
+            if self.expand_dns_queries and shown_query_count > 5:
+                dns_header += f" {Colors.SOFT_OLIVE}press \"-\" to show less {Colors.RESET}"
+            elif not self.expand_dns_queries:
+                dns_header += f" {Colors.SOFT_OLIVE}press \"-\" to expand{Colors.RESET}"
+            right_rows = [dns_header]
+            if recent_queries:
+                for query in recent_queries:
+                    timestamp = time.strftime("%H:%M:%S", time.localtime(query['time']))
+                    answer = query['answers'][0] if query['answers'] else "-"
+                    dns_line = f"{timestamp} {query['query']} -> {answer}"
+                    right_rows.append(f"{Colors.CYAN}{truncate_visible(dns_line, right_panel_width)}{Colors.RESET}")
+            else:
+                right_rows.append(f"{Colors.GREY}(no recent DNS queries){Colors.RESET}")
+            # Dynamic bump: <5 queries => no bump, 5 => +1, 6 => +2 ... up to 12 => +8.
+            extra_rows = max(0, shown_query_count - 4)
+            min_combined_rows = base_header_rows + extra_rows
+            total_rows = max(len(left_rows), len(right_rows), min_combined_rows)
         for idx in range(total_rows):
             left = left_rows[idx] if idx < len(left_rows) else ""
             left_padded = fit_visible(left, box_width)
@@ -1227,13 +1365,27 @@ class ConnectionTracker:
         if line_limit and lines_printed >= line_limit:
             return
         if group_by_process:
-            self._print_grouped_by_process(sorted_connections, count, line_limit, lines_printed if line_limit else None)
+            self._print_grouped_by_process(
+                sorted_connections,
+                display_current_bandwidths,
+                display_histories,
+                count,
+                line_limit,
+                lines_printed if line_limit else None
+            )
         else:
-            remaining_lines = self._print_flat_list(sorted_connections, count, line_limit, lines_printed if line_limit else None)
+            remaining_lines = self._print_flat_list(
+                sorted_connections,
+                display_current_bandwidths,
+                display_histories,
+                count,
+                line_limit,
+                lines_printed if line_limit else None
+            )
             if line_limit and remaining_lines:
                 lines_printed = remaining_lines
 
-    def _print_flat_list(self, sorted_connections, count, line_limit=None, lines_printed=0):
+    def _print_flat_list(self, sorted_connections, display_current_bandwidths, display_histories, count, line_limit=None, lines_printed=0):
         if line_limit:
             lines_printed += 1
             if lines_printed >= line_limit:
@@ -1245,6 +1397,7 @@ class ConnectionTracker:
             if line_limit and lines_printed >= line_limit:
                 break
             proto, src_ip, src_port, dst_ip, dst_port = conn
+            endpoint_width = 20
             total_size, packet_count, process_info = stats
             proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(proto, f"IP{proto}")
             proto_color = get_protocol_color(proto_name)
@@ -1255,36 +1408,39 @@ class ConnectionTracker:
                 process_display = f"{Colors.MAGENTA}{process_name:<15}{Colors.RESET}"
             else:
                 process_display = f"{Colors.MAGENTA}{'-':<15}{Colors.RESET}"
-            bytes_display = f"{Colors.YELLOW}{self._format_total_metric(total_size):>11}{Colors.RESET}"
-            current_bw = self.current_bandwidths.get(conn, 0)
+            metric_text = self._format_unpriv_packet_cell(total_size) if self.unprivileged_mode else self._format_total_metric(total_size)
+            metric_pad = "  " if self.unprivileged_mode else " "
+            bytes_display = f"{Colors.YELLOW}{metric_text:>11}{Colors.RESET}"
+            current_bw = display_current_bandwidths.get(conn, 0)
             current_scale = self._metric_color_scale_value(current_bw)
             current_bw_color = get_unpriv_visual_color(current_scale) if self.unprivileged_mode else get_visual_color(current_scale)
             current_bw_display = f"{current_bw_color}{self._format_rate_metric(current_bw)}{Colors.RESET}"
-            colored_history = self.get_colored_bandwidth_history(conn)
+            colored_history = display_histories.get(conn, self.get_colored_bandwidth_history(conn))
             src_display = self.get_hostname(src_ip) if args.resolve else src_ip
             dst_display = self.get_hostname(dst_ip) if args.resolve else dst_ip
             if args.resolve:
-                src_display = src_display[-21:]
-                dst_display = dst_display[-21:]
+                src_display = src_display[-endpoint_width:]
+                dst_display = dst_display[-endpoint_width:]
             else:
-                src_display = src_display[:21]
-                dst_display = dst_display[:21]
+                src_display = src_display[:endpoint_width]
+                dst_display = dst_display[:endpoint_width]
             if proto in (6, 17):
-                print(f"{proto_color}{proto_name:4}{Colors.RESET} Src: {Colors.CYAN}{src_display:21}:{src_port:<6}{Colors.RESET} ⥄ "
-                      f"Dst: {Colors.CYAN}{dst_display:21}:{dst_port:<6}{Colors.RESET} "
+                print(f"{proto_color}{proto_name:4}{Colors.RESET} Src: {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  ⥄  "
+                      f"Dst: {Colors.CYAN}{dst_display:20}:{dst_port:<9}{Colors.RESET}  "
                       f"{process_display} "
-                      f"{bytes_display} {current_bw_display} {colored_history}")
+                      f"{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
             else:
-                print(f"{proto_color}{proto_name:4}{Colors.RESET} Src: {Colors.CYAN}{src_display:21}       {Colors.RESET} ⥄ "
-                      f"Dst: {Colors.CYAN}{dst_display:21}       {Colors.RESET} "
+                print(f"{proto_color}{proto_name:4}{Colors.RESET} Src: {Colors.CYAN}{src_display:20}          {Colors.RESET}  ⥄  "
+                      f"Dst: {Colors.CYAN}{dst_display:20}          {Colors.RESET}  "
                       f"{process_display} "
-                      f"{bytes_display} {current_bw_display} {colored_history}")
+                      f"{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
             displayed += 1
             if line_limit:
                 lines_printed += 1
         return lines_printed if line_limit else None
 
-    def _print_grouped_by_process(self, sorted_connections, count, line_limit=None, lines_printed=0):
+    def _print_grouped_by_process(self, sorted_connections, display_current_bandwidths, display_histories, count, line_limit=None, lines_printed=0):
+        header_center_width = 132
         process_groups = defaultdict(list)
         unknown_connections = []
         for conn, stats in sorted_connections:
@@ -1308,7 +1464,7 @@ class ConnectionTracker:
             packet_count = sum(stats[1] for _, stats in process_connections)
             duration = time.time() - self.start_time
             bytes_per_sec = total_process_bytes / duration if duration > 0 else 0
-            current_bw = sum(self.current_bandwidths.get(conn, 0) for conn, _ in process_connections)
+            current_bw = sum(display_current_bandwidths.get(conn, 0) for conn, _ in process_connections)
             bytes_scale = self._metric_color_scale_value(bytes_per_sec)
             current_scale = self._metric_color_scale_value(current_bw)
             bandwidth_color = get_unpriv_visual_color(bytes_scale) if self.unprivileged_mode else get_visual_color(bytes_scale)
@@ -1324,41 +1480,45 @@ class ConnectionTracker:
                 connections_to_show = min(connections_to_show, max(0, remaining - 2))
                 if connections_to_show == 0:
                     break
-            print(f"{Colors.MAGENTA}{Colors.BOLD}[{process_name}]{Colors.RESET} "
-                  f"{Colors.SOFT_OLIVE}•{Colors.RESET} "
-                  f"Total: {bytes_display} in "
-                  f"{Colors.BOLD}{int(packet_count)}{Colors.RESET} packets "
-                  f"({bandwidth_color}{self._format_rate_metric(bytes_per_sec)}{Colors.RESET}) {process_bw_display}")
+            header_text = (
+                f"[{process_name}] • Total: {self._format_total_metric(total_process_bytes)} in "
+                f"{int(packet_count):,} packets ({self._format_rate_metric(bytes_per_sec)}) "
+                f"{self._format_rate_metric(current_bw)}"
+            )
+            print(f"{Colors.BOLD}{Colors.WHITE}{header_text.center(header_center_width)}{Colors.RESET}")
             lines_printed += 1
             for i, (conn, stats) in enumerate(sorted_process_connections):
                 if i >= connections_to_show:
                     break
                 proto, src_ip, src_port, dst_ip, dst_port = conn
+                endpoint_width = 20
                 total_size, packet_count, _ = stats
                 proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(proto, f"IP{proto}")
                 proto_color = get_protocol_color(proto_name)
-                bytes_display = f"{Colors.YELLOW}{self._format_total_metric(total_size):>12}{Colors.RESET}"
-                current_bw = self.current_bandwidths.get(conn, 0)
+                metric_text = self._format_unpriv_packet_cell(total_size) if self.unprivileged_mode else self._format_total_metric(total_size)
+                metric_pad = "  " if self.unprivileged_mode else " "
+                bytes_display = f"{Colors.YELLOW}{metric_text:>12}{Colors.RESET}"
+                current_bw = display_current_bandwidths.get(conn, 0)
                 current_scale = self._metric_color_scale_value(current_bw)
                 current_bw_color = get_unpriv_visual_color(current_scale) if self.unprivileged_mode else get_visual_color(current_scale)
                 current_bw_display = f"{current_bw_color}{self._format_rate_metric(current_bw)}{Colors.RESET}"
-                colored_history = self.get_colored_bandwidth_history(conn)
+                colored_history = display_histories.get(conn, self.get_colored_bandwidth_history(conn))
                 src_display = self.get_hostname(src_ip) if args.resolve else src_ip
                 dst_display = self.get_hostname(dst_ip) if args.resolve else dst_ip
                 if args.resolve:
-                    src_display = src_display[-21:]
-                    dst_display = dst_display[-21:]
+                    src_display = src_display[-endpoint_width:]
+                    dst_display = dst_display[-endpoint_width:]
                 else:
-                    src_display = src_display[:21]
-                    dst_display = dst_display[:21]
+                    src_display = src_display[:endpoint_width]
+                    dst_display = dst_display[:endpoint_width]
                 if proto in (6, 17):
-                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:21}:{src_port:<6}{Colors.RESET} → "
-                          f"{Colors.CYAN}{dst_display:21}:{dst_port:<6}{Colors.RESET} "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}: {bytes_display} {current_bw_display} {colored_history}")
+                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  →  "
+                          f"{Colors.CYAN}{dst_display:20}:{dst_port:<9}{Colors.RESET}  "
+                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
                 else:
-                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:21}       {Colors.RESET} → "
-                          f"{Colors.CYAN}{dst_display:21} {Colors.RESET} "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}: {bytes_display} {current_bw_display} {colored_history}")
+                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}          {Colors.RESET}  →  "
+                          f"{Colors.CYAN}{dst_display:20} {Colors.RESET}  "
+                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
                 lines_printed += 1
             print()
             lines_printed += 1
@@ -1368,7 +1528,7 @@ class ConnectionTracker:
             unknown_packets = sum(stats[1] for _, stats in unknown_connections)
             duration = time.time() - self.start_time
             bytes_per_sec = unknown_bytes / duration if duration > 0 else 0
-            current_bw = sum(self.current_bandwidths.get(conn, 0) for conn, _ in unknown_connections)
+            current_bw = sum(display_current_bandwidths.get(conn, 0) for conn, _ in unknown_connections)
             bytes_scale = self._metric_color_scale_value(bytes_per_sec)
             current_scale = self._metric_color_scale_value(current_bw)
             bandwidth_color = get_unpriv_visual_color(bytes_scale) if self.unprivileged_mode else get_visual_color(bytes_scale)
@@ -1384,41 +1544,45 @@ class ConnectionTracker:
                 connections_to_show = min(connections_to_show, max(0, remaining - 2))
                 if connections_to_show == 0:
                     return lines_printed
-            print(f"{Colors.RED}{Colors.BOLD}[Unknown Processes]{Colors.RESET} "
-                  f"{Colors.SOFT_OLIVE}•{Colors.RESET} "
-                  f"Total: {bytes_display} in "
-                  f"{Colors.BOLD}{int(unknown_packets)}{Colors.RESET} packets "
-                  f"({bandwidth_color}{self._format_rate_metric(bytes_per_sec)}{Colors.RESET}) {unknown_bw_display}")
+            header_text = (
+                f"[Unknown Processes] • Total: {self._format_total_metric(unknown_bytes)} in "
+                f"{int(unknown_packets):,} packets ({self._format_rate_metric(bytes_per_sec)}) "
+                f"{self._format_rate_metric(current_bw)}"
+            )
+            print(f"{Colors.BOLD}{Colors.WHITE}{header_text.center(header_center_width)}{Colors.RESET}")
             lines_printed += 1
             for i, (conn, stats) in enumerate(sorted_unknown_connections):
                 if i >= connections_to_show:
                     break
                 proto, src_ip, src_port, dst_ip, dst_port = conn
+                endpoint_width = 20
                 total_size, packet_count, _ = stats
                 proto_name = {6: "TCP", 17: "UDP", 1: "ICMP"}.get(proto, f"IP{proto}")
                 proto_color = get_protocol_color(proto_name)
-                bytes_display = f"{Colors.YELLOW}{self._format_total_metric(total_size):>12}{Colors.RESET}"
-                current_bw = self.current_bandwidths.get(conn, 0)
+                metric_text = self._format_unpriv_packet_cell(total_size) if self.unprivileged_mode else self._format_total_metric(total_size)
+                metric_pad = "  " if self.unprivileged_mode else " "
+                bytes_display = f"{Colors.YELLOW}{metric_text:>12}{Colors.RESET}"
+                current_bw = display_current_bandwidths.get(conn, 0)
                 current_scale = self._metric_color_scale_value(current_bw)
                 current_bw_color = get_unpriv_visual_color(current_scale) if self.unprivileged_mode else get_visual_color(current_scale)
                 current_bw_display = f"{current_bw_color}{self._format_rate_metric(current_bw)}{Colors.RESET}"
-                colored_history = self.get_colored_bandwidth_history(conn)
+                colored_history = display_histories.get(conn, self.get_colored_bandwidth_history(conn))
                 src_display = self.get_hostname(src_ip) if args.resolve else src_ip
                 dst_display = self.get_hostname(dst_ip) if args.resolve else dst_ip
                 if args.resolve:
-                    src_display = src_display[-21:]
-                    dst_display = dst_display[-21:]
+                    src_display = src_display[-endpoint_width:]
+                    dst_display = dst_display[-endpoint_width:]
                 else:
-                    src_display = src_display[:21]
-                    dst_display = dst_display[:21]
+                    src_display = src_display[:endpoint_width]
+                    dst_display = dst_display[:endpoint_width]
                 if proto in (6, 17):
-                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:21}:{src_port:<6}{Colors.RESET} → "
-                          f"{Colors.CYAN}{dst_display:21}:{dst_port:<6}{Colors.RESET} "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}: {bytes_display} {current_bw_display} {colored_history}")
+                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  →  "
+                          f"{Colors.CYAN}{dst_display:20}:{dst_port:<9}{Colors.RESET}  "
+                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
                 else:
-                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:21}       {Colors.RESET} → "
-                          f"{Colors.CYAN}{dst_display:21}       {Colors.RESET} "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}: {bytes_display} {current_bw_display} {colored_history}")
+                    print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}          {Colors.RESET}  →  "
+                          f"{Colors.CYAN}{dst_display:20}          {Colors.RESET}  "
+                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
                 lines_printed += 1
             print()
             lines_printed += 1
@@ -1461,7 +1625,7 @@ def enable_dns_toggle_shortcut(tracker):
     return True
 
 tracker = ConnectionTracker(unprivileged_mode=RUN_UNPRIVILEGED)
-dns_toggle_enabled = enable_dns_toggle_shortcut(tracker)
+dns_toggle_enabled = enable_dns_toggle_shortcut(tracker) if not RUN_UNPRIVILEGED else False
 
 def print_report(signum=None, frame=None):
     line_limit = 60 if args.truncate_output else None
@@ -1495,9 +1659,11 @@ if args.group:
     print(f"{Colors.YELLOW}Grouping connections by process{Colors.RESET}")
 if args.resolve:
     print(f"{Colors.YELLOW}DNS resolution enabled (using /etc/hosts, captured DNS, and reverse lookups){Colors.RESET}")
+if args.merge_highport_sockets:
+    print(f"{Colors.YELLOW}Merging close-range high-port sockets enabled (-m){Colors.RESET}")
 if RUN_UNPRIVILEGED:
     print(f"{Colors.YELLOW}Unprivileged mode enabled: packet counts are used as size surrogates{Colors.RESET}")
-if dns_toggle_enabled:
+if dns_toggle_enabled and not RUN_UNPRIVILEGED:
     print(f"{Colors.YELLOW}Press '-' to expand or retract Latest DNS Queries (compact max: 5){Colors.RESET}")
 print(f"{Colors.GREEN}Generating reports every {args.time} seconds...{Colors.RESET}")
 
@@ -1634,4 +1800,3 @@ else:
                     tracker.add_packet(protocol, src_addr, 0, dst_addr, 0, ip_total_len)
     except KeyboardInterrupt:
         pass
-
