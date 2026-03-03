@@ -186,6 +186,9 @@ def parse_ethernet(packet):
     eth_protocol = socket.ntohs(eth[2])
     return eth_protocol, src_mac, dest_mac, packet[eth_length:]
 
+ETH_PROTO_IPV4 = socket.ntohs(0x0800)
+ETH_PROTO_IPV6 = socket.ntohs(0x86DD)
+
 def parse_ip(packet):
     if len(packet) < 20:
         return None, None, None, None, None
@@ -199,6 +202,46 @@ def parse_ip(packet):
     src_addr = socket.inet_ntoa(iph[8])
     dst_addr = socket.inet_ntoa(iph[9])
     return protocol, src_addr, dst_addr, packet[iph_length:], total_length
+
+def parse_ipv6(packet):
+    if len(packet) < 40:
+        return None, None, None, None, None
+    version = packet[0] >> 4
+    if version != 6:
+        return None, None, None, None, None
+
+    payload_length = struct.unpack('!H', packet[4:6])[0]
+    next_header = packet[6]
+    src_addr = socket.inet_ntop(socket.AF_INET6, packet[8:24])
+    dst_addr = socket.inet_ntop(socket.AF_INET6, packet[24:40])
+
+    offset = 40
+    ext_headers = {0, 43, 44, 50, 51, 60, 135, 139, 140}
+    while next_header in ext_headers:
+        if next_header in (0, 43, 60, 135, 139, 140):
+            if offset + 2 > len(packet):
+                return None, None, None, None, None
+            next_header, ext_len = packet[offset], packet[offset + 1]
+            header_len = (ext_len + 1) * 8
+        elif next_header == 44:
+            if offset + 8 > len(packet):
+                return None, None, None, None, None
+            next_header = packet[offset]
+            header_len = 8
+        elif next_header == 51:
+            if offset + 2 > len(packet):
+                return None, None, None, None, None
+            next_header, ext_len = packet[offset], packet[offset + 1]
+            header_len = (ext_len + 2) * 4
+        else:
+            break
+
+        if header_len <= 0 or offset + header_len > len(packet):
+            return None, None, None, None, None
+        offset += header_len
+
+    total_length = 40 + payload_length
+    return next_header, src_addr, dst_addr, packet[offset:], total_length
 
 def parse_tcp(packet):
     if len(packet) < 20:
@@ -389,6 +432,7 @@ class Colors:
     YELLOW = "\033[38;5;151m"
     BLUE = "\033[34m"
     MAGENTA = "\033[38;5;140m"
+    LIGHT_PURPLE = "\033[38;5;183m"
     CYAN = "\033[97m"
     WHITE = "\033[37m"
     BOLD = "\033[1m"
@@ -540,42 +584,35 @@ class SocketProcessMapper:
 
     def _refresh_linux(self):
         try:
-            with open('/proc/net/tcp', 'r') as f:
-                lines = f.readlines()[1:]
-                for line in lines:
-                    parts = line.strip().split()
-                    local = parts[1]
-                    remote = parts[2]
-                    uid = int(parts[7])
-                    inode = parts[9]
-                    local_ip, local_port = self._hex_to_ip_port(local)
-                    remote_ip, remote_port = self._hex_to_ip_port(remote)
-                    self.socket_to_process[inode] = {
-                        'local': (local_ip, local_port),
-                        'remote': (remote_ip, remote_port),
-                        'uid': uid,
-                        'proto': 'tcp',
-                        'pid': None,
-                        'process': None
-                    }
-            with open('/proc/net/udp', 'r') as f:
-                lines = f.readlines()[1:]
-                for line in lines:
-                    parts = line.strip().split()
-                    local = parts[1]
-                    remote = parts[2]
-                    uid = int(parts[7])
-                    inode = parts[9]
-                    local_ip, local_port = self._hex_to_ip_port(local)
-                    remote_ip, remote_port = self._hex_to_ip_port(remote)
-                    self.socket_to_process[inode] = {
-                        'local': (local_ip, local_port),
-                        'remote': (remote_ip, remote_port),
-                        'uid': uid,
-                        'proto': 'udp',
-                        'pid': None,
-                        'process': None
-                    }
+            net_files = (
+                ('/proc/net/tcp', 'tcp'),
+                ('/proc/net/udp', 'udp'),
+                ('/proc/net/tcp6', 'tcp'),
+                ('/proc/net/udp6', 'udp'),
+            )
+            for proc_path, proto in net_files:
+                if not os.path.exists(proc_path):
+                    continue
+                with open(proc_path, 'r') as f:
+                    lines = f.readlines()[1:]
+                    for line in lines:
+                        parts = line.strip().split()
+                        if len(parts) < 10:
+                            continue
+                        local = parts[1]
+                        remote = parts[2]
+                        uid = int(parts[7])
+                        inode = parts[9]
+                        local_ip, local_port = self._hex_to_ip_port(local)
+                        remote_ip, remote_port = self._hex_to_ip_port(remote)
+                        self.socket_to_process[inode] = {
+                            'local': (local_ip, local_port),
+                            'remote': (remote_ip, remote_port),
+                            'uid': uid,
+                            'proto': proto,
+                            'pid': None,
+                            'process': None
+                        }
             for pid in os.listdir('/proc'):
                 if not pid.isdigit():
                     continue
@@ -692,8 +729,14 @@ class SocketProcessMapper:
 
     def _hex_to_ip_port(self, hex_str):
         ip_hex, port_hex = hex_str.split(':')
-        ip_parts = [int(ip_hex[i:i+2], 16) for i in range(6, -2, -2)]
-        ip = '.'.join(map(str, ip_parts))
+        if len(ip_hex) == 8:
+            ip_parts = [int(ip_hex[i:i+2], 16) for i in range(6, -2, -2)]
+            ip = '.'.join(map(str, ip_parts))
+        elif len(ip_hex) == 32:
+            ip_bytes = bytes.fromhex(ip_hex)
+            ip = socket.inet_ntop(socket.AF_INET6, ip_bytes)
+        else:
+            ip = '0.0.0.0'
         port = int(port_hex, 16)
         return ip, port
 
@@ -735,7 +778,7 @@ class SocketProcessMapper:
                     (local_ip == dst_ip and local_port == dst_port and
                      remote_ip == src_ip and remote_port == src_port)):
                     return {'process': socket_info['process']}
-                if local_ip == '0.0.0.0' and local_port == src_port:
+                if local_ip in ('0.0.0.0', '::') and local_port == src_port:
                     return {'process': socket_info['process']}
             return None
 
@@ -827,6 +870,23 @@ class ConnectionTracker:
         if self.unprivileged_mode:
             return f"{value:,.1f} pps"
         return f"{format_bytes(value)}/s"
+
+    def _format_socket_rate_field(self, value):
+        # Keep unprivileged per-socket PPS width stable so the history graph does not shift.
+        if self.unprivileged_mode:
+            return f"{value:>5.1f} pps"
+        return self._format_rate_metric(value)
+
+    def _format_duration(self, duration_seconds):
+        if duration_seconds > 3600:
+            total_minutes = math.ceil(duration_seconds / 60)
+            hours, minutes = divmod(total_minutes, 60)
+            return f"{hours}h {minutes}m"
+        if duration_seconds > 600:
+            minutes = int(duration_seconds // 60)
+            seconds = int(duration_seconds % 60)
+            return f"{minutes}m {seconds}s"
+        return f"{duration_seconds:.1f} seconds"
 
     def _format_unpriv_packet_cell(self, value):
         # Keep packet-count column compact in unprivileged mode.
@@ -1303,12 +1363,17 @@ class ConnectionTracker:
         left_rows = [f"{Colors.BOLD}{Colors.HEADER_MOSS}┌{'─' * (box_width - 2)}┐{Colors.RESET}"]
         platform_str = f"Platform: {Colors.CYAN}{platform.system()} {platform.release()}{Colors.RESET}"
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET} {pad_visible(platform_str, left_inner_width - 1)}{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}")
-        duration_str = f"Duration: {Colors.CYAN}{duration:.1f} seconds{Colors.RESET}"
+        duration_str = f"Duration: {Colors.CYAN}{self._format_duration(duration)}{Colors.RESET}"
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET} {pad_visible(duration_str, left_inner_width - 1)}{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}")
-        total_str = (
-            f" Cumulative Total: {Colors.MOSS_GREEN}{self._format_total_metric(total_bytes)}{Colors.RESET} "
-            f"in {Colors.MOSS_GREEN}{int(total_packets):,}{Colors.RESET} packets"
-        )
+        if self.unprivileged_mode:
+            total_str = (
+                f" Cumulative Total: {Colors.MOSS_GREEN}{int(total_packets):,}{Colors.RESET} total packets"
+            )
+        else:
+            total_str = (
+                f" Cumulative Total: {Colors.MOSS_GREEN}{self._format_total_metric(total_bytes)}{Colors.RESET} "
+                f"in {Colors.MOSS_GREEN}{int(total_packets):,}{Colors.RESET} packets"
+            )
         left_rows.append(f"{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}{pad_visible(total_str, left_inner_width)}{Colors.BOLD}{Colors.HEADER_MOSS}│{Colors.RESET}")
         current_color = get_unpriv_visual_color(self.current_total_bw) if self.unprivileged_mode else get_visual_color((self.current_total_bw * 8) / 1000)
         peak_color = get_unpriv_visual_color(self.peak_total_bw) if self.unprivileged_mode else get_visual_color((self.peak_total_bw * 8) / 1000)
@@ -1385,6 +1450,9 @@ class ConnectionTracker:
             if line_limit and remaining_lines:
                 lines_printed = remaining_lines
 
+    def _process_header_text(self, process_label, packet_count):
+        return f"[{process_label}] • Total Packet Count: {int(packet_count):,}"
+
     def _print_flat_list(self, sorted_connections, display_current_bandwidths, display_histories, count, line_limit=None, lines_printed=0):
         if line_limit:
             lines_printed += 1
@@ -1405,16 +1473,17 @@ class ConnectionTracker:
                 process_name = process_info['process']
                 if len(process_name) > 15:
                     process_name = process_name[:12] + "."
-                process_display = f"{Colors.MAGENTA}{process_name:<15}{Colors.RESET}"
+                process_display = f"{Colors.LIGHT_PURPLE}{process_name:<15}{Colors.RESET}"
             else:
-                process_display = f"{Colors.MAGENTA}{'-':<15}{Colors.RESET}"
+                process_display = f"{Colors.LIGHT_PURPLE}{'-':<15}{Colors.RESET}"
             metric_text = self._format_unpriv_packet_cell(total_size) if self.unprivileged_mode else self._format_total_metric(total_size)
             metric_pad = "  " if self.unprivileged_mode else " "
+            history_sep = "" if self.unprivileged_mode else metric_pad
             bytes_display = f"{Colors.YELLOW}{metric_text:>11}{Colors.RESET}"
             current_bw = display_current_bandwidths.get(conn, 0)
             current_scale = self._metric_color_scale_value(current_bw)
             current_bw_color = get_unpriv_visual_color(current_scale) if self.unprivileged_mode else get_visual_color(current_scale)
-            current_bw_display = f"{current_bw_color}{self._format_rate_metric(current_bw)}{Colors.RESET}"
+            current_bw_display = f"{current_bw_color}{self._format_socket_rate_field(current_bw)}{Colors.RESET}"
             colored_history = display_histories.get(conn, self.get_colored_bandwidth_history(conn))
             src_display = self.get_hostname(src_ip) if args.resolve else src_ip
             dst_display = self.get_hostname(dst_ip) if args.resolve else dst_ip
@@ -1428,19 +1497,19 @@ class ConnectionTracker:
                 print(f"{proto_color}{proto_name:4}{Colors.RESET} Src: {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  ⥄  "
                       f"Dst: {Colors.CYAN}{dst_display:20}:{dst_port:<9}{Colors.RESET}  "
                       f"{process_display} "
-                      f"{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
+                      f"{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
             else:
                 print(f"{proto_color}{proto_name:4}{Colors.RESET} Src: {Colors.CYAN}{src_display:20}          {Colors.RESET}  ⥄  "
                       f"Dst: {Colors.CYAN}{dst_display:20}          {Colors.RESET}  "
                       f"{process_display} "
-                      f"{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
+                      f"{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
             displayed += 1
             if line_limit:
                 lines_printed += 1
         return lines_printed if line_limit else None
 
     def _print_grouped_by_process(self, sorted_connections, display_current_bandwidths, display_histories, count, line_limit=None, lines_printed=0):
-        header_center_width = 132
+        header_indent = " " * 20
         process_groups = defaultdict(list)
         unknown_connections = []
         for conn, stats in sorted_connections:
@@ -1480,12 +1549,9 @@ class ConnectionTracker:
                 connections_to_show = min(connections_to_show, max(0, remaining - 2))
                 if connections_to_show == 0:
                     break
-            header_text = (
-                f"[{process_name}] • Total: {self._format_total_metric(total_process_bytes)} in "
-                f"{int(packet_count):,} packets ({self._format_rate_metric(bytes_per_sec)}) "
-                f"{self._format_rate_metric(current_bw)}"
-            )
-            print(f"{Colors.BOLD}{Colors.WHITE}{header_text.center(header_center_width)}{Colors.RESET}")
+            process_label = f"{Colors.LIGHT_PURPLE}{process_name}{Colors.RESET}"
+            header_text = self._process_header_text(process_label, packet_count)
+            print(f"{Colors.BOLD}{Colors.WHITE}{header_indent}{header_text}{Colors.RESET}")
             lines_printed += 1
             for i, (conn, stats) in enumerate(sorted_process_connections):
                 if i >= connections_to_show:
@@ -1497,11 +1563,12 @@ class ConnectionTracker:
                 proto_color = get_protocol_color(proto_name)
                 metric_text = self._format_unpriv_packet_cell(total_size) if self.unprivileged_mode else self._format_total_metric(total_size)
                 metric_pad = "  " if self.unprivileged_mode else " "
+                history_sep = "" if self.unprivileged_mode else metric_pad
                 bytes_display = f"{Colors.YELLOW}{metric_text:>12}{Colors.RESET}"
                 current_bw = display_current_bandwidths.get(conn, 0)
                 current_scale = self._metric_color_scale_value(current_bw)
                 current_bw_color = get_unpriv_visual_color(current_scale) if self.unprivileged_mode else get_visual_color(current_scale)
-                current_bw_display = f"{current_bw_color}{self._format_rate_metric(current_bw)}{Colors.RESET}"
+                current_bw_display = f"{current_bw_color}{self._format_socket_rate_field(current_bw)}{Colors.RESET}"
                 colored_history = display_histories.get(conn, self.get_colored_bandwidth_history(conn))
                 src_display = self.get_hostname(src_ip) if args.resolve else src_ip
                 dst_display = self.get_hostname(dst_ip) if args.resolve else dst_ip
@@ -1514,11 +1581,11 @@ class ConnectionTracker:
                 if proto in (6, 17):
                     print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  →  "
                           f"{Colors.CYAN}{dst_display:20}:{dst_port:<9}{Colors.RESET}  "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
+                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
                 else:
                     print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}          {Colors.RESET}  →  "
                           f"{Colors.CYAN}{dst_display:20} {Colors.RESET}  "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
+                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
                 lines_printed += 1
             print()
             lines_printed += 1
@@ -1544,12 +1611,9 @@ class ConnectionTracker:
                 connections_to_show = min(connections_to_show, max(0, remaining - 2))
                 if connections_to_show == 0:
                     return lines_printed
-            header_text = (
-                f"[Unknown Processes] • Total: {self._format_total_metric(unknown_bytes)} in "
-                f"{int(unknown_packets):,} packets ({self._format_rate_metric(bytes_per_sec)}) "
-                f"{self._format_rate_metric(current_bw)}"
-            )
-            print(f"{Colors.BOLD}{Colors.WHITE}{header_text.center(header_center_width)}{Colors.RESET}")
+            process_label = f"{Colors.LIGHT_PURPLE}Unknown Processes{Colors.RESET}"
+            header_text = self._process_header_text(process_label, unknown_packets)
+            print(f"{Colors.BOLD}{Colors.WHITE}{header_indent}{header_text}{Colors.RESET}")
             lines_printed += 1
             for i, (conn, stats) in enumerate(sorted_unknown_connections):
                 if i >= connections_to_show:
@@ -1561,11 +1625,12 @@ class ConnectionTracker:
                 proto_color = get_protocol_color(proto_name)
                 metric_text = self._format_unpriv_packet_cell(total_size) if self.unprivileged_mode else self._format_total_metric(total_size)
                 metric_pad = "  " if self.unprivileged_mode else " "
+                history_sep = "" if self.unprivileged_mode else metric_pad
                 bytes_display = f"{Colors.YELLOW}{metric_text:>12}{Colors.RESET}"
                 current_bw = display_current_bandwidths.get(conn, 0)
                 current_scale = self._metric_color_scale_value(current_bw)
                 current_bw_color = get_unpriv_visual_color(current_scale) if self.unprivileged_mode else get_visual_color(current_scale)
-                current_bw_display = f"{current_bw_color}{self._format_rate_metric(current_bw)}{Colors.RESET}"
+                current_bw_display = f"{current_bw_color}{self._format_socket_rate_field(current_bw)}{Colors.RESET}"
                 colored_history = display_histories.get(conn, self.get_colored_bandwidth_history(conn))
                 src_display = self.get_hostname(src_ip) if args.resolve else src_ip
                 dst_display = self.get_hostname(dst_ip) if args.resolve else dst_ip
@@ -1578,11 +1643,11 @@ class ConnectionTracker:
                 if proto in (6, 17):
                     print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}:{src_port:<9}{Colors.RESET}  →  "
                           f"{Colors.CYAN}{dst_display:20}:{dst_port:<9}{Colors.RESET}  "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
+                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
                 else:
                     print(f"  {proto_color}{proto_name:4}{Colors.RESET} {Colors.CYAN}{src_display:20}          {Colors.RESET}  →  "
                           f"{Colors.CYAN}{dst_display:20}          {Colors.RESET}  "
-                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{metric_pad}{colored_history}")
+                          f"{'Pkts' if self.unprivileged_mode else 'Bytes'}:{metric_pad}{bytes_display}{metric_pad}{current_bw_display}{history_sep}{colored_history}")
                 lines_printed += 1
             print()
             lines_printed += 1
@@ -1725,8 +1790,11 @@ elif IS_MACOS:
                         result = parse_ethernet(packet_buffer)
                         if result[0] is not None:
                             eth_protocol, src_mac, dest_mac, ip_packet = result
-                            if eth_protocol == 8 and ip_packet:  # IPv4
-                                result = parse_ip(ip_packet)
+                            if eth_protocol in (ETH_PROTO_IPV4, ETH_PROTO_IPV6) and ip_packet:
+                                if eth_protocol == ETH_PROTO_IPV4:
+                                    result = parse_ip(ip_packet)
+                                else:
+                                    result = parse_ipv6(ip_packet)
                                 if result[0] is not None:
                                     protocol, src_addr, dst_addr, transport_packet, ip_total_len = result
                                     is_port_53 = is_port_53_traffic(protocol, transport_packet)
@@ -1772,8 +1840,11 @@ else:
             if result[0] is None:
                 continue
             eth_protocol, src_mac, dest_mac, ip_packet = result
-            if eth_protocol == 8:
-                result = parse_ip(ip_packet)
+            if eth_protocol in (ETH_PROTO_IPV4, ETH_PROTO_IPV6):
+                if eth_protocol == ETH_PROTO_IPV4:
+                    result = parse_ip(ip_packet)
+                else:
+                    result = parse_ipv6(ip_packet)
                 if result[0] is None:
                     continue
                 protocol, src_addr, dst_addr, transport_packet, ip_total_len = result
