@@ -87,100 +87,6 @@ def parse_ip_cidr_or_domain(value):
         )
     return tuple(networks)
 
-parser = argparse.ArgumentParser(
-    prog='unpa.py',
-    description='UNPA NetHound privileged network traffic analyzer.',
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-    epilog=(
-        "Startup behavior:\n"
-        "  no arguments      -> runs with: -t 1 -n -e -g -r\n"
-        "  -o only           -> runs with: -t 1 -n -g\n"
-        "  -o with other args-> -o is ignored; provided args are used as-is\n"
-        "\n"
-        "Examples:\n"
-        "  python3 unpa.py\n"
-        "  python3 unpa.py -o\n"
-        "  python3 unpa.py -ee 208.10.10.11 -ee 207.10.0.0/16\n"
-        "  python3 unpa.py -ii 134.0.0.0/8\n"
-        "  python3 unpa.py -ii google.com\n"
-        "\n"
-        "Runtime shortcuts:\n"
-        "  x -> toggle truncation on/off (off shows full scroll-safe output)\n"
-        "  - -> toggle DNS panel expansion (privileged mode only)\n"
-    ),
-)
-parser.add_argument('-n', '--no-local', action='store_true',
-                    help='Exclude localhost-only traffic (localhost and 127.0.0.0/24).')
-parser.add_argument('-t', '--time', type=int, default=10,
-                    help='Seconds between report refreshes (parser default: 10).')
-parser.add_argument('-c', '--count', type=int, default=20,
-                    help='Maximum number of connections/process groups to display (default: 20).')
-parser.add_argument('-p', '--process', type=str,
-                    help='Show only connections for process names matching this substring.')
-parser.add_argument('-g', '--group', action='store_true',
-                    help='Group output by process name instead of a flat connection list.')
-parser.add_argument('-d', '--dns-count', type=int, default=5,
-                    help='Number of recent DNS query entries shown in report output (default: 5).')
-parser.add_argument('-e', '--exclude-lan', action='store_true',
-                    help='Exclude LAN-to-LAN traffic in 192.168.0.0/16, 172.0.0.0/8, and 10.0.0.0/8. Port 53 bypass applies unless -nodns is set.')
-parser.add_argument('-ee', '--exclude-extra', action='append', default=[], type=parse_ip_or_cidr, metavar='IP_OR_CIDR',
-                    help='Exclude additional IP/CIDR targets (repeatable), e.g. -ee 208.10.10.11 or -ee 207.10.0.0/16.')
-parser.add_argument('-ii', '--include-only', action='append', default=[], type=parse_ip_cidr_or_domain, metavar='IP_CIDR_OR_DOMAIN',
-                    help='Capture only traffic matching these IP/CIDR/domain targets (repeatable). Domains resolve to current A/AAAA addresses.')
-parser.add_argument('-o', '--default-no-resolve', action='store_true',
-                    help='Special startup switch: if this is the only arg, run -t 1 -n -g (no -r). Ignored when combined with other flags.')
-parser.add_argument('-nodns', '--no-dns-bypass', action='store_true',
-                    help='Disable the -e port-53 bypass so DNS traffic is filtered like other traffic.')
-parser.add_argument('-r', '--resolve', action='store_true',
-                    help='Resolve endpoint IPs to names using /etc/hosts, captured DNS, and reverse lookups.')
-parser.add_argument('-i', '--interface', type=str, default=None,
-                    help='Capture interface (macOS examples: en0/en1; Linux examples: eth0/wlan0).')
-parser.add_argument('-m', '--merge-highport-sockets', action='store_true',
-                    help='Merge sockets that only differ by high src/dst ports (>35000) when those ports are in a close range (gap <= 9).')
-parser.add_argument('--version', action='version', version=f'%(prog)s {APP_VERSION}',
-                    help='Show program version and exit.')
-
-cli_args = sys.argv[1:]
-if len(cli_args) == 1 and cli_args[0] in ('-o', '--default-no-resolve'):
-    args = parser.parse_args(['-t', '1', '-n', '-g'])
-elif len(cli_args) == 1 and cli_args[0] in ('-h', '--help'):
-    args = parser.parse_args()
-elif len(cli_args) == 0:
-    args = parser.parse_args(['-t', '1', '-n', '-e', '-g', '-r'])
-else:
-    args = parser.parse_args()
-
-args.include_only = tuple(network for group in args.include_only for network in group)
-
-IS_ROOT = (not hasattr(os, "geteuid")) or (os.geteuid() == 0)
-RUN_UNPRIVILEGED = False
-
-# Socket creation - platform specific
-s = None
-if IS_LINUX:
-    if IS_ROOT:
-        try:
-            s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
-        except socket.error as e:
-            print(f'Socket creation error: {e}')
-            print('Note: This script requires root/sudo privileges')
-            sys.exit(1)
-    else:
-        RUN_UNPRIVILEGED = True
-elif IS_MACOS:
-    # For macOS, use tcpdump in privileged mode and psutil polling in unprivileged mode.
-    if IS_ROOT:
-        print(f"Running on macOS - using BPF packet capture")
-    else:
-        RUN_UNPRIVILEGED = True
-else:
-    print(f"Unsupported operating system: {platform.system()}")
-    sys.exit(1)
-
-if RUN_UNPRIVILEGED and psutil is None:
-    print("Unprivileged mode requires psutil. Install it with: pip install psutil")
-    sys.exit(1)
-
 def format_mac(mac_bytes):
     return ':'.join(f'{b:02x}' for b in mac_bytes)
 
@@ -1729,194 +1635,297 @@ def enable_keyboard_shortcuts(tracker):
     threading.Thread(target=key_listener, daemon=True).start()
     return True
 
-tracker = ConnectionTracker(unprivileged_mode=RUN_UNPRIVILEGED)
-shortcuts_enabled = enable_keyboard_shortcuts(tracker)
 
-def print_report(signum=None, frame=None):
-    no_truncation = not tracker.truncation_enabled
-    display_count = sys.maxsize if no_truncation else args.count
-    line_limit = None
-    tracker.print_report(
-        display_count,
-        args.process,
-        args.group,
-        args.dns_count,
-        line_limit,
-        no_truncation=no_truncation,
+def main():
+    global args
+
+    parser = argparse.ArgumentParser(
+        prog='unpa',
+        description='UNPA NetHound privileged network traffic analyzer.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Startup behavior:\n"
+            "  no arguments      -> runs with: -t 1 -n -e -g -r\n"
+            "  -o only           -> runs with: -t 1 -n -g\n"
+            "  -o with other args-> -o is ignored; provided args are used as-is\n"
+            "\n"
+            "Examples:\n"
+            "  unpa\n"
+            "  unpa -o\n"
+            "  unpa -ee 208.10.10.11 -ee 207.10.0.0/16\n"
+            "  unpa -ii 134.0.0.0/8\n"
+            "  unpa -ii google.com\n"
+            "\n"
+            "Runtime shortcuts:\n"
+            "  x -> toggle truncation on/off (off shows full scroll-safe output)\n"
+            "  - -> toggle DNS panel expansion (privileged mode only)\n"
+        ),
     )
-    if signum == signal.SIGALRM:
+    parser.add_argument('-n', '--no-local', action='store_true',
+                        help='Exclude localhost-only traffic (localhost and 127.0.0.0/24).')
+    parser.add_argument('-t', '--time', type=int, default=10,
+                        help='Seconds between report refreshes (parser default: 10).')
+    parser.add_argument('-c', '--count', type=int, default=20,
+                        help='Maximum number of connections/process groups to display (default: 20).')
+    parser.add_argument('-p', '--process', type=str,
+                        help='Show only connections for process names matching this substring.')
+    parser.add_argument('-g', '--group', action='store_true',
+                        help='Group output by process name instead of a flat connection list.')
+    parser.add_argument('-d', '--dns-count', type=int, default=5,
+                        help='Number of recent DNS query entries shown in report output (default: 5).')
+    parser.add_argument('-e', '--exclude-lan', action='store_true',
+                        help='Exclude LAN-to-LAN traffic in 192.168.0.0/16, 172.0.0.0/8, and 10.0.0.0/8. Port 53 bypass applies unless -nodns is set.')
+    parser.add_argument('-ee', '--exclude-extra', action='append', default=[], type=parse_ip_or_cidr, metavar='IP_OR_CIDR',
+                        help='Exclude additional IP/CIDR targets (repeatable), e.g. -ee 208.10.10.11 or -ee 207.10.0.0/16.')
+    parser.add_argument('-ii', '--include-only', action='append', default=[], type=parse_ip_cidr_or_domain, metavar='IP_CIDR_OR_DOMAIN',
+                        help='Capture only traffic matching these IP/CIDR/domain targets (repeatable). Domains resolve to current A/AAAA addresses.')
+    parser.add_argument('-o', '--default-no-resolve', action='store_true',
+                        help='Special startup switch: if this is the only arg, run -t 1 -n -g (no -r). Ignored when combined with other flags.')
+    parser.add_argument('-nodns', '--no-dns-bypass', action='store_true',
+                        help='Disable the -e port-53 bypass so DNS traffic is filtered like other traffic.')
+    parser.add_argument('-r', '--resolve', action='store_true',
+                        help='Resolve endpoint IPs to names using /etc/hosts, captured DNS, and reverse lookups.')
+    parser.add_argument('-i', '--interface', type=str, default=None,
+                        help='Capture interface (macOS examples: en0/en1; Linux examples: eth0/wlan0).')
+    parser.add_argument('-m', '--merge-highport-sockets', action='store_true',
+                        help='Merge sockets that only differ by high src/dst ports (>35000) when those ports are in a close range (gap <= 9).')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {APP_VERSION}',
+                        help='Show program version and exit.')
+
+    cli_args = sys.argv[1:]
+    if len(cli_args) == 1 and cli_args[0] in ('-o', '--default-no-resolve'):
+        args = parser.parse_args(['-t', '1', '-n', '-g'])
+    elif len(cli_args) == 1 and cli_args[0] in ('-h', '--help'):
+        args = parser.parse_args()
+    elif len(cli_args) == 0:
+        args = parser.parse_args(['-t', '1', '-n', '-e', '-g', '-r'])
+    else:
+        args = parser.parse_args()
+
+    args.include_only = tuple(network for group in args.include_only for network in group)
+
+    IS_ROOT = (not hasattr(os, "geteuid")) or (os.geteuid() == 0)
+    RUN_UNPRIVILEGED = False
+
+    # Socket creation - platform specific
+    s = None
+    if IS_LINUX:
+        if IS_ROOT:
+            try:
+                s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+            except socket.error as e:
+                print(f'Socket creation error: {e}')
+                print('Note: This script requires root/sudo privileges')
+                sys.exit(1)
+        else:
+            RUN_UNPRIVILEGED = True
+    elif IS_MACOS:
+        # For macOS, use tcpdump in privileged mode and psutil polling in unprivileged mode.
+        if IS_ROOT:
+            print(f"Running on macOS - using BPF packet capture")
+        else:
+            RUN_UNPRIVILEGED = True
+    else:
+        print(f"Unsupported operating system: {platform.system()}")
+        sys.exit(1)
+
+    if RUN_UNPRIVILEGED and psutil is None:
+        print("Unprivileged mode requires psutil. Install it with: pip install psutil")
+        sys.exit(1)
+
+
+    tracker = ConnectionTracker(unprivileged_mode=RUN_UNPRIVILEGED)
+    shortcuts_enabled = enable_keyboard_shortcuts(tracker)
+
+    def print_report(signum=None, frame=None):
+        no_truncation = not tracker.truncation_enabled
+        display_count = sys.maxsize if no_truncation else args.count
+        line_limit = None
+        tracker.print_report(
+            display_count,
+            args.process,
+            args.group,
+            args.dns_count,
+            line_limit,
+            no_truncation=no_truncation,
+        )
+        if signum == signal.SIGALRM:
+            signal.alarm(args.time)
+
+    signal.signal(signal.SIGALRM, print_report)
+    signal.signal(signal.SIGINT, lambda s, f: (print_report(), sys.exit(0)))
+
+    mode_label = "unprivileged" if RUN_UNPRIVILEGED else "privileged"
+    print(f"{Colors.GREEN}UNPA NetHound v{APP_VERSION} {mode_label} monitor - Press Ctrl+C to exit{Colors.RESET}")
+    print(f"{Colors.CYAN}Running on: {platform.system()} {platform.release()}{Colors.RESET}")
+    if args.no_local:
+        print(f"{Colors.YELLOW}Excluding localhost traffic (localhost and 127.0.0.0/24){Colors.RESET}")
+    if args.exclude_lan:
+        print(f"{Colors.YELLOW}Excluding LAN traffic (192.168.0.0/16 172.0.0.0/8 10.0.0.0/8){Colors.RESET}")
+    if args.exclude_extra:
+        extra_ranges_str = ", ".join(str(network) for network in args.exclude_extra)
+        print(f"{Colors.YELLOW}Excluding additional ranges: {extra_ranges_str}{Colors.RESET}")
+    if args.include_only:
+        include_ranges_str = ", ".join(str(network) for network in args.include_only)
+        print(f"{Colors.YELLOW}Including only ranges: {include_ranges_str}{Colors.RESET}")
+    if args.no_dns_bypass:
+        print(f"{Colors.YELLOW}DNS port 53 bypass disabled for -e filtering{Colors.RESET}")
+    if args.process:
+        print(f"{Colors.YELLOW}Filtering for process: {args.process}{Colors.RESET}")
+    if args.group:
+        print(f"{Colors.YELLOW}Grouping connections by process{Colors.RESET}")
+    if args.resolve:
+        print(f"{Colors.YELLOW}DNS resolution enabled (using /etc/hosts, captured DNS, and reverse lookups){Colors.RESET}")
+    if args.merge_highport_sockets:
+        print(f"{Colors.YELLOW}Merging close-range high-port sockets enabled (-m){Colors.RESET}")
+    if RUN_UNPRIVILEGED:
+        print(f"{Colors.YELLOW}Unprivileged mode enabled: packet counts are used as size surrogates{Colors.RESET}")
+    if shortcuts_enabled:
+        print(f"{Colors.YELLOW}Press 'x' to toggle truncation on/off (off = full scroll-safe output){Colors.RESET}")
+    if shortcuts_enabled and not RUN_UNPRIVILEGED:
+        print(f"{Colors.YELLOW}Press '-' to expand or retract Latest DNS Queries (compact max: 5){Colors.RESET}")
+    print(f"{Colors.GREEN}Generating reports every {args.time} seconds...{Colors.RESET}")
+
+    # Unprivileged polling mode (Linux/macOS userland path)
+    if RUN_UNPRIVILEGED:
+        signal.alarm(args.time)
+        try:
+            while True:
+                tracker.poll()
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+
+    # macOS packet capture using tcpdump
+    elif IS_MACOS:
+        # Determine interface
+        interface = args.interface
+        if not interface:
+            # Try to auto-detect active interface
+            try:
+                route_output = subprocess.check_output(['route', '-n', 'get', 'default']).decode('utf-8')
+                interface_match = re.search(r'interface:\s*(\S+)', route_output)
+                if interface_match:
+                    interface = interface_match.group(1)
+                else:
+                    interface = 'en0'  # Default fallback
+            except:
+                interface = 'en0'  # Default fallback
+
+        print(f"{Colors.CYAN}Capturing on interface: {interface}{Colors.RESET}")
+        print(f"{Colors.YELLOW}Note: Process mapping uses lsof (may have limited info for some connections){Colors.RESET}")
+
+        # Start tcpdump process
+        tcpdump_cmd = ['tcpdump', '-i', interface, '-n', '-e', '-xx', '-l']
+        tcpdump_process = subprocess.Popen(
+            tcpdump_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=1
+        )
+
         signal.alarm(args.time)
 
-signal.signal(signal.SIGALRM, print_report)
-signal.signal(signal.SIGINT, lambda s, f: (print_report(), sys.exit(0)))
-
-mode_label = "unprivileged" if RUN_UNPRIVILEGED else "privileged"
-print(f"{Colors.GREEN}UNPA NetHound v{APP_VERSION} {mode_label} monitor - Press Ctrl+C to exit{Colors.RESET}")
-print(f"{Colors.CYAN}Running on: {platform.system()} {platform.release()}{Colors.RESET}")
-if args.no_local:
-    print(f"{Colors.YELLOW}Excluding localhost traffic (localhost and 127.0.0.0/24){Colors.RESET}")
-if args.exclude_lan:
-    print(f"{Colors.YELLOW}Excluding LAN traffic (192.168.0.0/16 172.0.0.0/8 10.0.0.0/8){Colors.RESET}")
-if args.exclude_extra:
-    extra_ranges_str = ", ".join(str(network) for network in args.exclude_extra)
-    print(f"{Colors.YELLOW}Excluding additional ranges: {extra_ranges_str}{Colors.RESET}")
-if args.include_only:
-    include_ranges_str = ", ".join(str(network) for network in args.include_only)
-    print(f"{Colors.YELLOW}Including only ranges: {include_ranges_str}{Colors.RESET}")
-if args.no_dns_bypass:
-    print(f"{Colors.YELLOW}DNS port 53 bypass disabled for -e filtering{Colors.RESET}")
-if args.process:
-    print(f"{Colors.YELLOW}Filtering for process: {args.process}{Colors.RESET}")
-if args.group:
-    print(f"{Colors.YELLOW}Grouping connections by process{Colors.RESET}")
-if args.resolve:
-    print(f"{Colors.YELLOW}DNS resolution enabled (using /etc/hosts, captured DNS, and reverse lookups){Colors.RESET}")
-if args.merge_highport_sockets:
-    print(f"{Colors.YELLOW}Merging close-range high-port sockets enabled (-m){Colors.RESET}")
-if RUN_UNPRIVILEGED:
-    print(f"{Colors.YELLOW}Unprivileged mode enabled: packet counts are used as size surrogates{Colors.RESET}")
-if shortcuts_enabled:
-    print(f"{Colors.YELLOW}Press 'x' to toggle truncation on/off (off = full scroll-safe output){Colors.RESET}")
-if shortcuts_enabled and not RUN_UNPRIVILEGED:
-    print(f"{Colors.YELLOW}Press '-' to expand or retract Latest DNS Queries (compact max: 5){Colors.RESET}")
-print(f"{Colors.GREEN}Generating reports every {args.time} seconds...{Colors.RESET}")
-
-# Unprivileged polling mode (Linux/macOS userland path)
-if RUN_UNPRIVILEGED:
-    signal.alarm(args.time)
-    try:
-        while True:
-            tracker.poll()
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
-
-# macOS packet capture using tcpdump
-elif IS_MACOS:
-    # Determine interface
-    interface = args.interface
-    if not interface:
-        # Try to auto-detect active interface
+        # Read from tcpdump and parse packets
+        packet_buffer = b''
         try:
-            route_output = subprocess.check_output(['route', '-n', 'get', 'default']).decode('utf-8')
-            interface_match = re.search(r'interface:\s*(\S+)', route_output)
-            if interface_match:
-                interface = interface_match.group(1)
-            else:
-                interface = 'en0'  # Default fallback
-        except:
-            interface = 'en0'  # Default fallback
-    
-    print(f"{Colors.CYAN}Capturing on interface: {interface}{Colors.RESET}")
-    print(f"{Colors.YELLOW}Note: Process mapping uses lsof (may have limited info for some connections){Colors.RESET}")
-    
-    # Start tcpdump process
-    tcpdump_cmd = ['tcpdump', '-i', interface, '-n', '-e', '-xx', '-l']
-    tcpdump_process = subprocess.Popen(
-        tcpdump_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        bufsize=1
-    )
-    
-    signal.alarm(args.time)
-    
-    # Read from tcpdump and parse packets
-    packet_buffer = b''
-    try:
-        for line in iter(tcpdump_process.stdout.readline, b''):
-            try:
-                line = line.decode('utf-8', errors='ignore').strip()
-                
-                # Parse hex dump lines (starting with 0x)
-                if line.startswith('0x'):
-                    hex_part = line.split(':')[1].strip() if ':' in line else line[4:].strip()
-                    hex_bytes = hex_part.replace(' ', '')
-                    packet_buffer += bytes.fromhex(hex_bytes)
-                elif packet_buffer:
-                    # Process accumulated packet
-                    if len(packet_buffer) >= 14:
-                        result = parse_ethernet(packet_buffer)
-                        if result[0] is not None:
-                            eth_protocol, src_mac, dest_mac, ip_packet = result
-                            if eth_protocol in (ETH_PROTO_IPV4, ETH_PROTO_IPV6) and ip_packet:
-                                if eth_protocol == ETH_PROTO_IPV4:
-                                    result = parse_ip(ip_packet)
-                                else:
-                                    result = parse_ipv6(ip_packet)
-                                if result[0] is not None:
-                                    protocol, src_addr, dst_addr, transport_packet, ip_total_len = result
-                                    is_port_53 = is_port_53_traffic(protocol, transport_packet)
-                                    if args.no_local and is_local_traffic(src_addr, dst_addr):
-                                        packet_buffer = b''
-                                        continue
-                                    if args.exclude_lan and (args.no_dns_bypass or not is_port_53) and is_lan_traffic(src_addr, dst_addr):
-                                        packet_buffer = b''
-                                        continue
-                                    if args.exclude_extra and (is_excluded_extra_addr(src_addr) or is_excluded_extra_addr(dst_addr)):
-                                        packet_buffer = b''
-                                        continue
-                                    if args.include_only and not is_include_only_traffic(src_addr, dst_addr):
-                                        packet_buffer = b''
-                                        continue
-                                    if protocol == 6:  # TCP
-                                        result = parse_tcp(transport_packet)
-                                        if result[0] is not None:
-                                            src_port, dst_port = result
-                                            tracker.add_packet(protocol, src_addr, src_port, dst_addr, dst_port, ip_total_len)
-                                    elif protocol == 17:  # UDP
-                                        result = parse_udp(transport_packet)
-                                        if result[0] is not None:
-                                            src_port, dst_port = result
-                                            tracker.add_packet(protocol, src_addr, src_port, dst_addr, dst_port, ip_total_len, transport_packet)
+            for line in iter(tcpdump_process.stdout.readline, b''):
+                try:
+                    line = line.decode('utf-8', errors='ignore').strip()
+
+                    # Parse hex dump lines (starting with 0x)
+                    if line.startswith('0x'):
+                        hex_part = line.split(':')[1].strip() if ':' in line else line[4:].strip()
+                        hex_bytes = hex_part.replace(' ', '')
+                        packet_buffer += bytes.fromhex(hex_bytes)
+                    elif packet_buffer:
+                        # Process accumulated packet
+                        if len(packet_buffer) >= 14:
+                            result = parse_ethernet(packet_buffer)
+                            if result[0] is not None:
+                                eth_protocol, src_mac, dest_mac, ip_packet = result
+                                if eth_protocol in (ETH_PROTO_IPV4, ETH_PROTO_IPV6) and ip_packet:
+                                    if eth_protocol == ETH_PROTO_IPV4:
+                                        result = parse_ip(ip_packet)
                                     else:
-                                        tracker.add_packet(protocol, src_addr, 0, dst_addr, 0, ip_total_len)
+                                        result = parse_ipv6(ip_packet)
+                                    if result[0] is not None:
+                                        protocol, src_addr, dst_addr, transport_packet, ip_total_len = result
+                                        is_port_53 = is_port_53_traffic(protocol, transport_packet)
+                                        if args.no_local and is_local_traffic(src_addr, dst_addr):
+                                            packet_buffer = b''
+                                            continue
+                                        if args.exclude_lan and (args.no_dns_bypass or not is_port_53) and is_lan_traffic(src_addr, dst_addr):
+                                            packet_buffer = b''
+                                            continue
+                                        if args.exclude_extra and (is_excluded_extra_addr(src_addr) or is_excluded_extra_addr(dst_addr)):
+                                            packet_buffer = b''
+                                            continue
+                                        if args.include_only and not is_include_only_traffic(src_addr, dst_addr):
+                                            packet_buffer = b''
+                                            continue
+                                        if protocol == 6:  # TCP
+                                            result = parse_tcp(transport_packet)
+                                            if result[0] is not None:
+                                                src_port, dst_port = result
+                                                tracker.add_packet(protocol, src_addr, src_port, dst_addr, dst_port, ip_total_len)
+                                        elif protocol == 17:  # UDP
+                                            result = parse_udp(transport_packet)
+                                            if result[0] is not None:
+                                                src_port, dst_port = result
+                                                tracker.add_packet(protocol, src_addr, src_port, dst_addr, dst_port, ip_total_len, transport_packet)
+                                        else:
+                                            tracker.add_packet(protocol, src_addr, 0, dst_addr, 0, ip_total_len)
+                        packet_buffer = b''
+                except Exception as e:
                     packet_buffer = b''
-            except Exception as e:
-                packet_buffer = b''
-                continue
-    except KeyboardInterrupt:
-        tcpdump_process.terminate()
-        pass
-    
-else:
-    # Linux packet capture
-    signal.alarm(args.time)
-    try:
-        while True:
-            packet, addr = s.recvfrom(65535)
-            result = parse_ethernet(packet)
-            if result[0] is None:
-                continue
-            eth_protocol, src_mac, dest_mac, ip_packet = result
-            if eth_protocol in (ETH_PROTO_IPV4, ETH_PROTO_IPV6):
-                if eth_protocol == ETH_PROTO_IPV4:
-                    result = parse_ip(ip_packet)
-                else:
-                    result = parse_ipv6(ip_packet)
+                    continue
+        except KeyboardInterrupt:
+            tcpdump_process.terminate()
+            pass
+
+    else:
+        # Linux packet capture
+        signal.alarm(args.time)
+        try:
+            while True:
+                packet, addr = s.recvfrom(65535)
+                result = parse_ethernet(packet)
                 if result[0] is None:
                     continue
-                protocol, src_addr, dst_addr, transport_packet, ip_total_len = result
-                is_port_53 = is_port_53_traffic(protocol, transport_packet)
-                if args.no_local and is_local_traffic(src_addr, dst_addr):
-                    continue
-                if args.exclude_lan and (args.no_dns_bypass or not is_port_53) and is_lan_traffic(src_addr, dst_addr):
-                    continue
-                if args.exclude_extra and (is_excluded_extra_addr(src_addr) or is_excluded_extra_addr(dst_addr)):
-                    continue
-                if args.include_only and not is_include_only_traffic(src_addr, dst_addr):
-                    continue
-                if protocol == 6:
-                    result = parse_tcp(transport_packet)
-                    if result[0] is not None:
-                        src_port, dst_port = result
-                        tracker.add_packet(protocol, src_addr, src_port, dst_addr, dst_port, ip_total_len)
-                elif protocol == 17:
-                    result = parse_udp(transport_packet)
-                    if result[0] is not None:
-                        src_port, dst_port = result
-                        tracker.add_packet(protocol, src_addr, src_port, dst_addr, dst_port, ip_total_len, transport_packet)
-                else:
-                    tracker.add_packet(protocol, src_addr, 0, dst_addr, 0, ip_total_len)
-    except KeyboardInterrupt:
-        pass
+                eth_protocol, src_mac, dest_mac, ip_packet = result
+                if eth_protocol in (ETH_PROTO_IPV4, ETH_PROTO_IPV6):
+                    if eth_protocol == ETH_PROTO_IPV4:
+                        result = parse_ip(ip_packet)
+                    else:
+                        result = parse_ipv6(ip_packet)
+                    if result[0] is None:
+                        continue
+                    protocol, src_addr, dst_addr, transport_packet, ip_total_len = result
+                    is_port_53 = is_port_53_traffic(protocol, transport_packet)
+                    if args.no_local and is_local_traffic(src_addr, dst_addr):
+                        continue
+                    if args.exclude_lan and (args.no_dns_bypass or not is_port_53) and is_lan_traffic(src_addr, dst_addr):
+                        continue
+                    if args.exclude_extra and (is_excluded_extra_addr(src_addr) or is_excluded_extra_addr(dst_addr)):
+                        continue
+                    if args.include_only and not is_include_only_traffic(src_addr, dst_addr):
+                        continue
+                    if protocol == 6:
+                        result = parse_tcp(transport_packet)
+                        if result[0] is not None:
+                            src_port, dst_port = result
+                            tracker.add_packet(protocol, src_addr, src_port, dst_addr, dst_port, ip_total_len)
+                    elif protocol == 17:
+                        result = parse_udp(transport_packet)
+                        if result[0] is not None:
+                            src_port, dst_port = result
+                            tracker.add_packet(protocol, src_addr, src_port, dst_addr, dst_port, ip_total_len, transport_packet)
+                    else:
+                        tracker.add_packet(protocol, src_addr, 0, dst_addr, 0, ip_total_len)
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == '__main__':
+    main()
