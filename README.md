@@ -1,9 +1,29 @@
 
 
 **unpa.py unprivileged protocol analyzer**
-# Be like water, my friend. Flow with the network. 
+# Be like water, my friend. Flow with the network.
 
 UNPA NetHound: Real-time terminal network analyzer. Capture, summarize, hunt. Pure Python stdlib. Linux raw sockets (post-softIRQ). macOS tcpdump fallback.
+
+## Installation
+
+### pip
+```bash
+pip install unpa
+sudo unpa
+```
+
+### Homebrew (macOS/Linux)
+```bash
+brew install greenfan/tools/unpa
+sudo unpa
+```
+
+### From source
+```bash
+git clone https://github.com/greenfan/unpa.git
+cd unpa && sudo python3 unpa.py
+```
 
 ## Features
 - Ethernet/IPv4/IPv6 + TCP/UDP/ICMP/DNS parsing.
