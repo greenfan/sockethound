@@ -1,9 +1,9 @@
 
 
-**unpa.py unprivileged protocol analyzer**
+**unpa.py network protocol analyzer**
 # Be like water, my friend. Flow with the network.
 
-UNPA NetHound: Real-time terminal network analyzer. Capture, summarize, hunt. Pure Python stdlib. Linux raw sockets (post-softIRQ). macOS tcpdump fallback.
+UNPA NetHound: single-file real-time terminal network analyzer. Run as root/sudo for privileged capture; run unprivileged and it automatically falls back to the psutil-based analyzer. Pure Python stdlib, with psutil only for the unprivileged path. Linux raw sockets (post-softIRQ). macOS tcpdump fallback.
 
 ## Installation
 
@@ -77,3 +77,13 @@ sudo python3 unpa.py -e -nodns
 - Root for raw capture.
 - Fork/tweak. See `tcpdump_raw_parser` branch.
 - Hunt anomalies. Stay formless.
+
+## Screenshots
+
+<p align="center">
+  <img src="./_screenshot00.png" alt="UNPA privileged monitor showing live DNS queries and per-process traffic" width="31%" />
+  <img src="./_screenshot01.png" alt="UNPA privileged monitor showing live summary stats and traffic table" width="31%" />
+  <img src="./_screenshot02.png" alt="UNPA unprivileged monitor showing estimated packet counts by connection" width="31%" />
+</p>
+
+<p align="center"><em>Privileged capture on the left and center; unprivileged fallback on the right.</em></p>

@@ -759,12 +759,12 @@ class ConnectionTracker:
         self.truncation_enabled = True
         self.last_unpriv_poll_time = time.time()
         self.unpriv_prev_io = defaultdict(lambda: (0, 0))
-        # On macOS in unprivileged mode, per-process io counters are not reliable
-        # for network activity attribution. Use system packet counters instead.
-        self.unpriv_has_io_counters = (
-            self._check_io_counters_support() if (self.unprivileged_mode and not IS_MACOS) else False
-        )
-        self.unpriv_prev_net_io = psutil.net_io_counters() if self.unprivileged_mode else None
+        self.unpriv_monitor_interface = self._resolve_unprivileged_interface()
+        self.unpriv_monitor_addrs = self._get_interface_addresses(self.unpriv_monitor_interface)
+        # Packet counts in unprivileged mode come from interface packet deltas.
+        # psutil.Process().io_counters() reports disk I/O, not network I/O, so it must not be used here.
+        self.unpriv_has_io_counters = False
+        self.unpriv_prev_net_io = self._snapshot_unprivileged_net_io() if self.unprivileged_mode else None
         self.load_hosts()
         if args.resolve:
             self.resolver_thread = threading.Thread(target=self._resolver_thread, daemon=True)
@@ -776,6 +776,110 @@ class ConnectionTracker:
             return True
         except (AttributeError, NotImplementedError):
             return False
+
+    def _resolve_unprivileged_interface(self):
+        if not self.unprivileged_mode:
+            return None
+        if getattr(args, 'interface', None):
+            return args.interface
+
+        iface_stats = psutil.net_if_stats()
+        iface_addrs = psutil.net_if_addrs()
+        fallback_iface = None
+        for iface, stats in iface_stats.items():
+            if iface == 'lo' or not getattr(stats, 'isup', False):
+                continue
+            if fallback_iface is None:
+                fallback_iface = iface
+            addrs = iface_addrs.get(iface, [])
+            for addr in addrs:
+                if addr.family not in (socket.AF_INET, socket.AF_INET6):
+                    continue
+                try:
+                    ip_obj = ipaddress.ip_address(addr.address.split('%', 1)[0])
+                except ValueError:
+                    continue
+                if not ip_obj.is_loopback and not ip_obj.is_link_local and not ip_obj.is_unspecified:
+                    return iface
+        return fallback_iface
+
+    def _get_interface_addresses(self, interface):
+        addresses = set()
+        if not interface:
+            return addresses
+        for addr in psutil.net_if_addrs().get(interface, []):
+            if addr.family not in (socket.AF_INET, socket.AF_INET6):
+                continue
+            try:
+                ip_obj = ipaddress.ip_address(addr.address.split('%', 1)[0])
+            except ValueError:
+                continue
+            addresses.add(ip_obj)
+        return addresses
+
+    def _snapshot_unprivileged_net_io(self):
+        if not self.unprivileged_mode:
+            return None
+        if self.unpriv_monitor_interface:
+            pernic = psutil.net_io_counters(pernic=True)
+            if pernic:
+                return pernic.get(self.unpriv_monitor_interface)
+        return psutil.net_io_counters()
+
+    def _connection_matches_monitor_interface(self, src_addr, dst_addr):
+        if not self.unpriv_monitor_addrs:
+            return True
+        for addr_text in (src_addr, dst_addr):
+            try:
+                ip_obj = ipaddress.ip_address(addr_text.split('%', 1)[0])
+            except ValueError:
+                continue
+            if ip_obj in self.unpriv_monitor_addrs:
+                return True
+        return False
+
+    def _unprivileged_socket_packet_weight(self, conn, src_addr, src_port, dst_addr, dst_port, proto, current_packets=0):
+        weight = 1.0
+
+        if proto == 6:  # TCP
+            weight *= 1.15
+            if conn.status == psutil.CONN_ESTABLISHED:
+                weight *= 1.15
+            else:
+                weight *= 0.85
+        elif proto == 17:  # UDP
+            weight *= 0.95
+        else:
+            weight *= 0.75
+
+        ports = {src_port, dst_port}
+        if 53 in ports:  # DNS tends to be chatty and packet-heavy.
+            weight *= 1.8
+        elif 123 in ports:  # NTP
+            weight *= 1.35
+        elif 67 in ports or 68 in ports:  # DHCP / BOOTP
+            weight *= 1.25
+        elif 5353 in ports:  # mDNS
+            weight *= 1.3
+        elif proto == 17 and 443 in ports:  # QUIC / HTTP3
+            weight *= 1.1
+        elif min(ports) < 1024:
+            weight *= 1.08
+
+        try:
+            src_ip = ipaddress.ip_address(src_addr.split('%', 1)[0])
+            dst_ip = ipaddress.ip_address(dst_addr.split('%', 1)[0])
+            if src_ip.is_private != dst_ip.is_private:
+                weight *= 1.12
+            elif src_ip.is_private and dst_ip.is_private:
+                weight *= 0.98
+        except ValueError:
+            pass
+
+        if current_packets > 0:
+            weight *= 1.0 + min(math.log1p(current_packets) / 8.0, 0.65)
+
+        return max(weight, 0.05)
 
     def _format_total_metric(self, value):
         if self.unprivileged_mode:
@@ -838,6 +942,8 @@ class ConnectionTracker:
 
         proc_keys = defaultdict(list)
         all_keys = []
+        weighted_keys = []
+        total_weight = 0.0
         for conn, conn_pid in conns:
             if not conn.laddr or not conn.raddr:
                 continue
@@ -861,6 +967,8 @@ class ConnectionTracker:
                 continue
             if args.include_only and not is_include_only_traffic(src_addr, dst_addr):
                 continue
+            if not self._connection_matches_monitor_interface(src_addr, dst_addr):
+                continue
 
             if f"{src_addr}:{src_port}" < f"{dst_addr}:{dst_port}":
                 key = (proto, src_addr, src_port, dst_addr, dst_port)
@@ -868,8 +976,13 @@ class ConnectionTracker:
                 key = (proto, dst_addr, dst_port, src_addr, src_port)
 
             # Ensure connection appears in reports even without PID attribution.
-            _ = self.connections[key]
+            stats = self.connections[key]
             all_keys.append(key)
+            weight = self._unprivileged_socket_packet_weight(
+                conn, src_addr, src_port, dst_addr, dst_port, proto, current_packets=stats[1]
+            )
+            weighted_keys.append((key, weight))
+            total_weight += weight
             pid = conn_pid
             if pid:
                 proc_keys[pid].append(key)
@@ -883,35 +996,25 @@ class ConnectionTracker:
             elif self.connections[key][2] is None:
                 self.connections[key][2] = {'process': 'Unknown'}
 
-        if self.unpriv_has_io_counters:
-            for pid, keys in proc_keys.items():
-                if not keys:
-                    continue
-                try:
-                    io_counters = psutil.Process(pid).io_counters()
-                except (psutil.NoSuchProcess, psutil.AccessDenied, PermissionError, AttributeError):
-                    continue
-                prev_write, prev_read = self.unpriv_prev_io[pid]
-                delta = (io_counters.write_count - prev_write) + (io_counters.read_count - prev_read)
-                if delta < 0:
-                    delta = 0
-                per_conn_packets = delta / len(keys) if keys else 0
-                for key in keys:
-                    self.connections[key][0] += per_conn_packets
-                    self.connections[key][1] += per_conn_packets
-                self.unpriv_prev_io[pid] = (io_counters.write_count, io_counters.read_count)
-        else:
-            net_io = psutil.net_io_counters()
+        net_io = self._snapshot_unprivileged_net_io()
+        if net_io is not None and self.unpriv_prev_net_io is not None:
             delta = (net_io.packets_sent - self.unpriv_prev_net_io.packets_sent) + (
                 net_io.packets_recv - self.unpriv_prev_net_io.packets_recv
             )
             if delta < 0:
                 delta = 0
-            if all_keys and delta > 0:
-                per_conn_packets = delta / len(all_keys)
-                for key in all_keys:
-                    self.connections[key][0] += per_conn_packets
-                    self.connections[key][1] += per_conn_packets
+            if weighted_keys and delta > 0:
+                if total_weight <= 0:
+                    total_weight = float(len(weighted_keys))
+                assigned = 0.0
+                for idx, (key, weight) in enumerate(weighted_keys):
+                    if idx == len(weighted_keys) - 1:
+                        packet_share = delta - assigned
+                    else:
+                        packet_share = delta * (weight / total_weight)
+                        assigned += packet_share
+                    self.connections[key][0] += packet_share
+                    self.connections[key][1] += packet_share
             self.unpriv_prev_net_io = net_io
 
         self.last_unpriv_poll_time = now
@@ -1779,7 +1882,9 @@ def main():
     if args.merge_highport_sockets:
         print(f"{Colors.YELLOW}Merging close-range high-port sockets enabled (-m){Colors.RESET}")
     if RUN_UNPRIVILEGED:
-        print(f"{Colors.YELLOW}Unprivileged mode enabled: packet counts are used as size surrogates{Colors.RESET}")
+        print(f"{Colors.YELLOW}Unprivileged mode enabled: packet counts are estimated from interface packet deltas and weighted by socket class/activity{Colors.RESET}")
+        if tracker.unpriv_monitor_interface:
+            print(f"{Colors.YELLOW}Unprivileged mode scoped to interface: {tracker.unpriv_monitor_interface}{Colors.RESET}")
     if shortcuts_enabled:
         print(f"{Colors.YELLOW}Press 'x' to toggle truncation on/off (off = full scroll-safe output){Colors.RESET}")
     if shortcuts_enabled and not RUN_UNPRIVILEGED:
